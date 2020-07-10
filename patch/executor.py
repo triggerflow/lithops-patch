@@ -1,42 +1,43 @@
+#
+# Copyright 2018 PyWren Team
+# (C) Copyright IBM Corp. 2020
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
 import os
-import sys
 import copy
-import time
-import json
-import redis
 import signal
 import logging
-import subprocess
 from functools import partial
-from pywren_research.invoker import FunctionInvoker
-from pywren_research.storage import InternalStorage
-from pywren_research.storage.utils import clean_os_bucket
-from pywren_research.wait import wait_storage, wait_rabbitmq, ALL_COMPLETED
-from pywren_research.job import create_map_job, create_reduce_job
-from pywren_research.config import default_config, extract_storage_config, EXECUTION_TIMEOUT, JOBS_PREFIX, default_logging_config
-from pywren_research.utils import timeout_handler, is_notebook, is_unix_system, is_pywren_function, create_executor_id
-from pywren_research.libs.triggerflow import TriggerflowClient, CloudEvent, DefaultActions, DefaultConditions
-from pywren_research.libs.triggerflow.utils import load_config_yaml
+from pywren_ibm_cloud.invoker import FunctionInvoker
+from pywren_ibm_cloud.storage import InternalStorage
+from pywren_ibm_cloud.storage.utils import delete_cloudobject
+from pywren_ibm_cloud.wait import wait_storage, wait_rabbitmq, ALL_COMPLETED
+from pywren_ibm_cloud.job import create_map_job, create_reduce_job, clean_job
+from pywren_ibm_cloud.config import default_config, extract_storage_config, default_logging_config
+from pywren_ibm_cloud.utils import timeout_handler, is_notebook, is_unix_system, is_pywren_function, create_executor_id
 
+from pywren_ibm_cloud.triggerflow.eventsources import KafkaEventSource, RedisEventSource, CloudantEventSource, ObjectStorageEventSource
+from pywren_research.libs.triggerflow import TriggerflowClient, CloudEvent, DefaultActions, DefaultConditions
 from multiprocessing.pool import ThreadPool
 
 logger = logging.getLogger(__name__)
 
-##
-## Function Executor event-sourcing based on cloudant
-##
-
 
 class FunctionExecutor:
 
-    class State:
-        New = 'New'
-        Running = 'Running'
-        Ready = 'Ready'
-        Done = 'Done'
-        Error = 'Error'
-
-    def __init__(self, config=None, runtime=None, runtime_memory=None, compute_backend=None,
+    def __init__(self, config=None, execution_id=None, runtime=None, runtime_memory=None, compute_backend=None,
                  compute_backend_region=None, storage_backend=None, storage_backend_region=None,
                  workers=None, rabbitmq_monitor=None, remote_invoker=None, log_level=None):
         """
@@ -55,9 +56,19 @@ class FunctionExecutor:
 
         :return `FunctionExecutor` object.
         """
-        self.start_time = time.time()
-        self._state = FunctionExecutor.State.New
         self.is_pywren_function = is_pywren_function()
+
+        # ------------------ TRIGGERFLOW -------------------
+        if execution_id:
+            logger.info('Got Execution ID: {}'.format(execution_id))
+            os.environ['PYWREN_EXECUTION_ID'] = execution_id
+            os.environ['PYWREN_FIRST_EXEC'] = 'False'
+        else:
+            os.environ['PYWREN_FIRST_EXEC'] = 'True'
+            os.environ.pop('PYWREN_EXECUTION_ID', None)
+
+        self.event_sourcing = eval(os.environ.get('PYWREN_EVENT_SOURCING', 'False'))
+        # --------------------------------------------------
 
         # Log level Configuration
         self.log_level = log_level
@@ -95,7 +106,7 @@ class FunctionExecutor:
         self.executor_id = create_executor_id()
         logger.debug('FunctionExecutor created with ID: {}'.format(self.executor_id))
 
-        self.data_cleaner = self.config['pywren'].get('data_cleaner', False)
+        self.data_cleaner = self.config['pywren'].get('data_cleaner', True)
         self.rabbitmq_monitor = self.config['pywren'].get('rabbitmq_monitor', False)
 
         if self.rabbitmq_monitor:
@@ -107,58 +118,43 @@ class FunctionExecutor:
 
         storage_config = extract_storage_config(self.config)
         self.internal_storage = InternalStorage(storage_config)
+        self.storage = self.internal_storage.storage
+
+        # ------------------ TRIGGERFLOW -------------------
+        if self.event_sourcing:
+            sink = self.config['triggerflow']['sink']
+            if sink == 'kafka':
+                event_source = KafkaEventSource(self.config)
+            elif sink == 'redis':
+                event_source = RedisEventSource(self.config)
+            elif sink == 'cloudant':
+                event_source = CloudantEventSource(self.config)
+            else:
+                event_source = ObjectStorageEventSource(self.config)
+
+            self.event_sourcing_jobs = event_source.get_events()
+            logger.info('Triggerflow - Creating client')
+            self.tf = TriggerflowClient(**self.config['triggerflow'])
+            self.tf.target_workspace(os.environ['__OW_TF_WORKSPACE'])
+        # --------------------------------------------------
+
+        self.invoker = FunctionInvoker(self.config, self.executor_id, self.internal_storage)
 
         self.futures = []
         self.total_jobs = 0
         self.cleaned_jobs = set()
+        self.last_call = None
 
-        # event-sourcing
-        self.event_sourcing_jobs = {}
-        if eval(os.environ.get('PYWREN_EVENT_SOURCING', 'False')):
-            self.event_sourcing = True
-            tf_config = load_config_yaml('~/.client_config')
-
-            if os.environ.get('PYWREN_FIRST_EXEC') == 'False':
-                logger.info('Event sourcing - Recovering events from redis')
-                to = time.time()
-                redis_client = redis.StrictRedis(**tf_config['redis'],
-                                                 charset="utf-8",
-                                                 decode_responses=True)
-                records = redis_client.xread({'pywren-redis-eventsource': '0'}, block=5)[0][1]
-                logger.info('Jobs downloaded - TOTAL: {} - TIME: {}s'.format(len(records), round(time.time()-to, 3)))
-                if not records:
-                    exit()
-            else:
-                records = []
-
-            for e_id, event in records:
-                if event['subject'].startswith(self.executor_id):
-                    executor_id, job_id, fn = event['subject'].rsplit('/', 2)
-                    data = json.loads(event['data'])
-                    if job_id not in self.event_sourcing_jobs:
-                        self.event_sourcing_jobs[job_id] = []
-                    self.event_sourcing_jobs[job_id].append(data)
-
-            logger.info('Event sourcing - Creating client')
-            tf_config['redis']['class'] = 'RedisEventSource'
-            tf_config['redis']['stream'] = 'pywren-redis-eventsource'
-            tf_config['redis']['name'] = 'pywren-redis-eventsource'
-            os.environ['__OW_TF_SINK'] = json.dumps(tf_config['redis'])
-            os.environ['__OW_TF_WORKSPACE'] = 'pywren'
-            self.ep = TriggerflowClient(**tf_config['triggerflow'])
-            self.ep.target_workspace('pywren')
-
-        self.invoker = FunctionInvoker(self.config, self.executor_id, self.internal_storage)
+    def __enter__(self):
+        return self
 
     def _create_job_id(self, call_type):
         job_id = str(self.total_jobs).zfill(3)
-        if self.total_jobs in [5, 10, 20, 40]:
-            print({'total_time': time.time()-float(os.environ['START_TIME'])})
         self.total_jobs += 1
         return '{}{}'.format(call_type, job_id)
 
     def call_async(self, func, data, extra_env=None, runtime_memory=None,
-                   timeout=EXECUTION_TIMEOUT, include_modules=[], exclude_modules=[]):
+                   timeout=None, include_modules=[], exclude_modules=[]):
         """
         For running one function execution asynchronously
 
@@ -174,6 +170,7 @@ class FunctionExecutor:
         :return: future object.
         """
         job_id = self._create_job_id('A')
+        self.last_call = 'call_async'
 
         already_invoked = False
         if self.event_sourcing:
@@ -223,41 +220,22 @@ class FunctionExecutor:
                          'function_url': 'https://us-east.functions.cloud.ibm.com/api/v1/namespaces/_/actions/pywren_event_sourcing',
                          'kind': 'callasync'}
                 )
-
             self.invoker.stop()
             del self.invoker
             del self.internal_storage
-            self.close_fds()
             exit()
 
         self.futures.extend(futures)
-        self._state = FunctionExecutor.State.Running
 
         return futures[0]
 
-    def close_fds(self):
-        cmd = "lsof -np {} | grep TCP".format(os.getpid())
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
-        fds = proc.stdout.read().split(b'\n')
-        print(len(fds))
-        for line in fds:
-            li = line.rstrip().decode()
-            if 'python' in li and ('10.1.129.50' in li):
-                print('Closing:', li)
-                fd = int(li.split()[3][:-1])
-                try:
-                    pass
-                    #os.close(fd)
-                except OSError:
-                    pass
-
-    def map(self, map_function, map_iterdata, extra_params=None, extra_env=None, runtime_memory=None,
-            chunk_size=None, chunk_n=None, timeout=EXECUTION_TIMEOUT, invoke_pool_threads=500,
+    def map(self, map_function, map_iterdata, extra_args=None, extra_env=None, runtime_memory=None,
+            chunk_size=None, chunk_n=None, timeout=None, invoke_pool_threads=500,
             include_modules=[], exclude_modules=[]):
         """
         :param map_function: the function to map over the data
         :param map_iterdata: An iterable of input data
-        :param extra_params: Additional parameters to pass to the function activation. Default None.
+        :param extra_args: Additional arguments to pass to the function activation. Default None.
         :param extra_env: Additional environment variables for action environment. Default None.
         :param runtime_memory: Memory to use to run the function. Default None (loaded from config).
         :param chunk_size: the size of the data chunks to split each object. 'None' for processing
@@ -273,6 +251,7 @@ class FunctionExecutor:
         :return: A list with size `len(iterdata)` of futures.
         """
         job_id = self._create_job_id('M')
+        self.last_call = 'map'
 
         already_invoked = False
         if self.event_sourcing:
@@ -335,18 +314,15 @@ class FunctionExecutor:
             self.invoker.stop()
             del self.invoker
             del self.internal_storage
-            self.close_fds()
             exit()
 
         self.futures.extend(futures)
-        self._state = FunctionExecutor.State.Running
-        if len(futures) == 1:
-            return futures[0]
+
         return futures
 
-    def map_reduce(self, map_function, map_iterdata, reduce_function, extra_params=None, extra_env=None,
+    def map_reduce(self, map_function, map_iterdata, reduce_function, extra_args=None, extra_env=None,
                    map_runtime_memory=None, reduce_runtime_memory=None, chunk_size=None, chunk_n=None,
-                   timeout=EXECUTION_TIMEOUT, invoke_pool_threads=500, reducer_one_per_object=False,
+                   timeout=None, invoke_pool_threads=500, reducer_one_per_object=False,
                    reducer_wait_local=False, include_modules=[], exclude_modules=[]):
         """
         Map the map_function over the data and apply the reduce_function across all futures.
@@ -356,7 +332,7 @@ class FunctionExecutor:
         :param map_iterdata:  the function to reduce over the futures
         :param reduce_function:  the function to reduce over the futures
         :param extra_env: Additional environment variables for action environment. Default None.
-        :param extra_params: Additional parameters to pass to function activation. Default None.
+        :param extra_args: Additional arguments to pass to function activation. Default None.
         :param map_runtime_memory: Memory to use to run the map function. Default None (loaded from config).
         :param reduce_runtime_memory: Memory to use to run the reduce function. Default None (loaded from config).
         :param chunk_size: the size of the data chunks to split each object. 'None' for processing
@@ -374,6 +350,7 @@ class FunctionExecutor:
         :return: A list with size `len(map_iterdata)` of futures.
         """
         map_job_id = self._create_job_id('M')
+        self.last_call = 'map_reduce'
 
         runtime_meta = self.invoker.select_runtime(map_job_id, map_runtime_memory)
 
@@ -383,15 +360,14 @@ class FunctionExecutor:
                                  iterdata=map_iterdata,
                                  runtime_meta=runtime_meta,
                                  runtime_memory=map_runtime_memory,
-                                 extra_params=extra_params,
+                                 extra_args=extra_args,
                                  extra_env=extra_env,
                                  obj_chunk_size=chunk_size,
                                  obj_chunk_number=chunk_n,
                                  invoke_pool_threads=invoke_pool_threads,
                                  include_modules=include_modules,
                                  exclude_modules=exclude_modules,
-                                 execution_timeout=timeout,
-                                 event_sourcing_jobs=self.event_sourcing_jobs)
+                                 execution_timeout=timeout)
 
         map_futures = self.invoker.run(map_job)
         self.futures.extend(map_futures)
@@ -411,17 +387,14 @@ class FunctionExecutor:
                                        runtime_memory=reduce_runtime_memory,
                                        extra_env=extra_env,
                                        include_modules=include_modules,
-                                       exclude_modules=exclude_modules,
-                                       event_sourcing_jobs=self.event_sourcing_jobs)
+                                       exclude_modules=exclude_modules)
 
         reduce_futures = self.invoker.run(reduce_job)
 
         self.futures.extend(reduce_futures)
 
         for f in map_futures:
-            f.produce_output = False
-
-        self._state = FunctionExecutor.State.Running
+            f._produce_output = False
 
         return map_futures + reduce_futures
 
@@ -448,20 +421,28 @@ class FunctionExecutor:
             and `fs_notdone` is a list of futures that have not completed.
         :rtype: 2-tuple of list
         """
-        futures = self.futures if not fs else fs
+        futures = fs or self.futures
         if type(futures) != list:
             futures = [futures]
+
         if not futures:
             raise Exception('You must run the call_async(), map() or map_reduce(), or provide'
                             ' a list of futures before calling the wait()/get_result() method')
 
         if download_results:
             msg = 'ExecutorID {} - Getting results...'.format(self.executor_id)
+            fs_done = [f for f in futures if f.done]
+            fs_not_done = [f for f in futures if not f.done]
+
         else:
             msg = 'ExecutorID {} - Waiting for functions to complete...'.format(self.executor_id)
-        logger.info(msg)
-        if not self.log_level and self._state == FunctionExecutor.State.Running:
-            print(msg)
+            fs_done = [f for f in futures if f.ready or f.done]
+            fs_not_done = [f for f in futures if not f.ready and not f.done]
+
+        if not fs_not_done:
+            return fs_done, fs_not_done
+
+        print(msg) if not self.log_level else logger.info(msg)
 
         if is_unix_system() and timeout is not None:
             logger.debug('Setting waiting timeout to {} seconds'.format(timeout))
@@ -470,20 +451,15 @@ class FunctionExecutor:
             signal.alarm(timeout)
 
         pbar = None
-        if not self.is_pywren_function and self._state == FunctionExecutor.State.Running \
-           and not self.log_level:
+        error = False
+        if not self.is_pywren_function and not self.log_level:
             from tqdm.auto import tqdm
 
-            if download_results:
-                total_to_check = len([f for f in futures if not f.done])
-            else:
-                total_to_check = len([f for f in futures if not f.ready and not (f.ready or f.done)])
-
             if is_notebook():
-                pbar = tqdm(bar_format='{n}/|/ {n_fmt}/{total_fmt}', total=total_to_check)  # ncols=800
+                pbar = tqdm(bar_format='{n}/|/ {n_fmt}/{total_fmt}', total=len(fs_not_done))  # ncols=800
             else:
                 print()
-                pbar = tqdm(bar_format='  {l_bar}{bar}| {n_fmt}/{total_fmt}  ', total=total_to_check, disable=False)
+                pbar = tqdm(bar_format='  {l_bar}{bar}| {n_fmt}/{total_fmt}  ', total=len(fs_not_done), disable=False)
 
         try:
             if self.rabbitmq_monitor:
@@ -503,33 +479,35 @@ class FunctionExecutor:
                 not_dones_call_ids = [(f.job_id, f.call_id) for f in futures if not f.ready and not f.done]
             msg = ('ExecutorID {} - Cancelled - Total Activations not done: {}'
                    .format(self.executor_id, len(not_dones_call_ids)))
-            self._state = FunctionExecutor.State.Error
+            if pbar:
+                pbar.close()
+                print()
+            print(msg) if not self.log_level else logger.info(msg)
+            error = True
 
         except Exception as e:
-            self._state = FunctionExecutor.State.Error
+            error = True
             raise e
 
         finally:
             self.invoker.stop()
             if is_unix_system():
                 signal.alarm(0)
-            if pbar:
+            if pbar and not pbar.disable:
                 pbar.close()
                 if not is_notebook():
                     print()
             if self.data_cleaner and not self.is_pywren_function:
-                self.clean()
-                if not fs and self._state == FunctionExecutor.State.Error and is_notebook():
-                    del self.futures[len(self.futures)-len(futures):]
+                self.clean(cloudobjects=False, force=False, log=False)
+            if not fs and error and is_notebook():
+                del self.futures[len(self.futures)-len(futures):]
 
         if download_results:
             fs_done = [f for f in futures if f.done]
             fs_notdone = [f for f in futures if not f.done]
-            self._state = FunctionExecutor.State.Done
         else:
             fs_done = [f for f in futures if f.ready or f.done]
             fs_notdone = [f for f in futures if not f.ready and not f.done]
-            self._state = FunctionExecutor.State.Ready
 
         return fs_done, fs_notdone
 
@@ -551,22 +529,24 @@ class FunctionExecutor:
                                                THREADPOOL_SIZE=THREADPOOL_SIZE,
                                                WAIT_DUR_SEC=WAIT_DUR_SEC)
         result = []
+        fs_done = [f for f in fs_done if not f.futures and f._produce_output]
         for f in fs_done:
-            if fs and not f.futures and f.produce_output:
+            if fs:
                 # Process futures provided by the user
                 result.append(f.result(throw_except=throw_except, internal_storage=self.internal_storage))
-            elif not fs and not f.futures and f.produce_output and not f.read:
+            elif not fs and not f._read:
                 # Process internally stored futures
                 result.append(f.result(throw_except=throw_except, internal_storage=self.internal_storage))
-                f.read = True
+                f._read = True
 
         logger.debug("ExecutorID {} Finished getting results".format(self.executor_id))
 
-        if result and len(result) == 1:
+        if len(result) == 1 and self.last_call != 'map':
             return result[0]
+
         return result
 
-    def create_execution_plots(self, dst_dir, dst_file_name, fs=None):
+    def plot(self, fs=None, dst=None):
         """
         Creates timeline and histogram of the current execution in dst_dir.
 
@@ -575,8 +555,10 @@ class FunctionExecutor:
         :param fs: list of futures.
         """
         ftrs = self.futures if not fs else fs
+
         if type(ftrs) != list:
             ftrs = [ftrs]
+
         ftrs_to_plot = [f for f in ftrs if (f.ready or f.done) and not f.error]
 
         if not ftrs_to_plot:
@@ -584,71 +566,50 @@ class FunctionExecutor:
             return
 
         logging.getLogger('matplotlib').setLevel(logging.WARNING)
-        from pywren_research.plots import create_timeline, create_histogram
+        from pywren_ibm_cloud.plots import create_timeline, create_histogram
 
         msg = 'ExecutorID {} - Creating execution plots'.format(self.executor_id)
-        logger.info(msg)
-        if not self.log_level:
-            print(msg)
+        print(msg) if not self.log_level else logger.info(msg)
 
-        call_status = [f._call_status for f in ftrs_to_plot]
-        call_metadata = [f._call_metadata for f in ftrs_to_plot]
+        create_timeline(ftrs_to_plot, dst)
+        create_histogram(ftrs_to_plot, dst)
 
-        create_timeline(dst_dir, dst_file_name, self.start_time, call_status, call_metadata, self.config['ibm_cos'])
-        create_histogram(dst_dir, dst_file_name, self.start_time, call_status, self.config['ibm_cos'])
-
-    def clean(self, fs=None, local_execution=True):
+    def clean(self, fs=None, cs=None, cloudobjects=True, force=True, log=True):
         """
         Deletes all the files from COS. These files include the function,
         the data serialization and the function invocation results.
         """
+        if cs:
+            storage_config = self.internal_storage.get_storage_config()
+            delete_cloudobject(list(cs), storage_config)
+            if not fs:
+                return
+
         futures = self.futures if not fs else fs
         if type(futures) != list:
             futures = [futures]
+
         if not futures:
+            logger.debug('ExecutorID {} - No jobs to clean'.format(self.executor_id))
             return
 
-        if not fs:
-            present_jobs = {(f.executor_id, f.job_id) for f in futures
-                            if (f.done or not f.produce_output)
-                            and f.executor_id.count('/') == 1}
-        else:
+        if fs or force:
             present_jobs = {(f.executor_id, f.job_id) for f in futures
                             if f.executor_id.count('/') == 1}
-
-        jobs_to_clean = present_jobs - self.cleaned_jobs
+            jobs_to_clean = present_jobs
+        else:
+            present_jobs = {(f.executor_id, f.job_id) for f in futures
+                            if f.done and f.executor_id.count('/') == 1}
+            jobs_to_clean = present_jobs - self.cleaned_jobs
 
         if jobs_to_clean:
             msg = "ExecutorID {} - Cleaning temporary data".format(self.executor_id)
-            logger.info(msg)
-            if not self.log_level:
-                print(msg)
+            print(msg) if not self.log_level and log else logger.info(msg)
+            storage_config = self.internal_storage.get_storage_config()
+            clean_job(jobs_to_clean, storage_config, clean_cloudobjects=cloudobjects)
+            self.cleaned_jobs.update(jobs_to_clean)
 
-        for executor_id, job_id in jobs_to_clean:
-            storage_bucket = self.config['pywren']['storage_bucket']
-            storage_prerix = '/'.join([JOBS_PREFIX, executor_id, job_id])
-
-            if local_execution:
-                # 1st case: Not background. The main code waits until the cleaner finishes its execution.
-                # It is not ideal for performance tests, since it can take long time to complete.
-                # clean_os_bucket(storage_bucket, storage_prerix, self.internal_storage)
-
-                # 2nd case: Execute in Background as a subprocess. The main program does not wait for its completion.
-                storage_config = json.dumps(self.internal_storage.get_storage_config())
-                storage_config = storage_config.replace('"', '\\"')
-
-                cmdstr = ('{} -c "from pywren_ibm_cloud.storage.utils import clean_bucket; \
-                                  clean_bucket(\'{}\', \'{}\', \'{}\')"'.format(sys.executable,
-                                                                                storage_bucket,
-                                                                                storage_prerix,
-                                                                                storage_config))
-                os.popen(cmdstr)
-            else:
-                extra_env = {'STORE_STATUS': False,
-                             'STORE_RESULT': False}
-                old_stdout = sys.stdout
-                sys.stdout = open(os.devnull, 'w')
-                self.call_async(clean_os_bucket, [storage_bucket, storage_prerix], extra_env=extra_env)
-                sys.stdout = old_stdout
-
-        self.cleaned_jobs.update(jobs_to_clean)
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.invoker.stop()
+        if self.data_cleaner:
+            self.clean(log=False)
