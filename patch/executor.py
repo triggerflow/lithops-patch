@@ -17,6 +17,7 @@
 
 import os
 import copy
+import time
 import signal
 import logging
 from functools import partial
@@ -29,7 +30,7 @@ from pywren_ibm_cloud.config import default_config, extract_storage_config, defa
 from pywren_ibm_cloud.utils import timeout_handler, is_notebook, is_unix_system, is_pywren_function, create_executor_id
 
 from pywren_ibm_cloud.triggerflow.eventsources import KafkaEventSource, RedisEventSource, CloudantEventSource, ObjectStorageEventSource
-from pywren_research.libs.triggerflow import TriggerflowClient, CloudEvent, DefaultActions, DefaultConditions
+from pywren_research.libs.triggerflow import Triggerflow, CloudEvent, DefaultActions, DefaultConditions
 from multiprocessing.pool import ThreadPool
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,7 @@ class FunctionExecutor:
 
     def __init__(self, config=None, execution_id=None, runtime=None, runtime_memory=None, compute_backend=None,
                  compute_backend_region=None, storage_backend=None, storage_backend_region=None,
-                 workers=None, rabbitmq_monitor=None, remote_invoker=None, log_level=None):
+                 workers=None, rabbitmq_monitor=None, remote_invoker=None, log_level=None, start_time=0):
         """
         Initialize a FunctionExecutor class.
 
@@ -66,6 +67,11 @@ class FunctionExecutor:
         else:
             os.environ['PYWREN_FIRST_EXEC'] = 'True'
             os.environ.pop('PYWREN_EXECUTION_ID', None)
+
+        if start_time == 0:
+            self.start_time = str(time.time())
+        else:
+            self.start_time = start_time
 
         self.event_sourcing = eval(os.environ.get('PYWREN_EVENT_SOURCING', 'False'))
         # --------------------------------------------------
@@ -134,11 +140,17 @@ class FunctionExecutor:
 
             self.event_sourcing_jobs = event_source.get_events()
             logger.info('Triggerflow - Creating client')
-            self.tf = TriggerflowClient(**self.config['triggerflow'])
-            self.tf.target_workspace(os.environ['__OW_TF_WORKSPACE'])
-        # --------------------------------------------------
 
-        self.invoker = FunctionInvoker(self.config, self.executor_id, self.internal_storage)
+            tf_sink = self.config['triggerflow']['sink']
+            tf_workspace = self.config['triggerflow']['workspace']
+
+            self.tf = Triggerflow(endpoint=self.config['triggerflow']['endpoint'],
+                                  user=self.config['triggerflow']['user'],
+                                  password=self.config['triggerflow']['password'])
+            self.tf.target_workspace(tf_workspace)
+
+        self.invoker = FunctionInvoker(self.config, self.executor_id, self.internal_storage, tf_sink, tf_workspace)
+        # --------------------------------------------------
 
         self.futures = []
         self.total_jobs = 0
@@ -216,7 +228,7 @@ class FunctionExecutor:
                 CloudEvent('{}/{}/{}'.format(self.executor_id, job_id, func.__name__)),
                 condition=DefaultConditions.TRUE,
                 action=DefaultActions.IBM_CF_INVOKE,
-                context={'function_args': {'execution_id': self.executor_id.split('/')[0], 'start_time': os.environ.get('START_TIME')},
+                context={'function_args': {'execution_id': self.executor_id.split('/')[0], 'start_time': self.start_time},
                          'function_url': 'https://us-east.functions.cloud.ibm.com/api/v1/namespaces/_/actions/pywren_event_sourcing',
                          'kind': 'callasync'}
                 )
@@ -307,7 +319,7 @@ class FunctionExecutor:
                 CloudEvent('{}/{}/{}'.format(self.executor_id, job_id, map_function.__name__)),
                 condition=DefaultConditions.FUNCTION_JOIN,
                 action=DefaultActions.IBM_CF_INVOKE,
-                context={'function_args': {'execution_id': self.executor_id.split('/')[0], 'start_time': os.environ.get('START_TIME')},
+                context={'function_args': {'execution_id': self.executor_id.split('/')[0], 'start_time': self.start_time},
                          'function_url': 'https://us-east.functions.cloud.ibm.com/api/v1/namespaces/_/actions/pywren_event_sourcing',
                          'kind': 'callasync', 'total_activations': len(map_iterdata)}
                 )

@@ -35,6 +35,6 @@ class TriggerflowExecutor:
             self.ow_client.create_action('triggerflow', name, code=code, memory=256,
                                          kind='python:3', is_binary=False)
 
-        payload = {'config': self.config, 'execution_id': None}
+        payload = {'config': self.config, 'execution_id': None, 'start_time': 0}
         self.ow_client.invoke('triggerflow', name, payload)
         logger.info('Coordinator function {} invoked '.format(name))
