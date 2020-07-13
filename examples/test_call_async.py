@@ -1,11 +1,10 @@
-from pywren_ibm_cloud.libs.triggerflow import TriggerflowClient, CloudEvent, PythonCallable
-from pywren_ibm_cloud.libs.triggerflow.utils import load_config_yaml
-from pywren_ibm_cloud.libs.triggerflow.sources import KafkaEventSource, RedisEventSource
-
+from pywren_ibm_cloud.libs.triggerflow import Triggerflow
+from pywren_ibm_cloud.libs.triggerflow.eventsources import KafkaEventSource, RedisEventSource
 from pywren_ibm_cloud.triggerflow import TriggerflowExecutor
 import pywren_ibm_cloud as pywren
 import os
 import time
+import yaml
 
 WORKSPACE = 'pywren'
 
@@ -53,8 +52,12 @@ def main(args):
 
 
 def create_tf_workspace():
-    tf_config = load_config_yaml('client_config.yaml')
-    tf = TriggerflowClient(**tf_config['triggerflow'])
+    with open('pywren_config.yaml', 'r') as config_file:
+        tf_config = yaml.safe_load(config_file)
+
+    tf = Triggerflow(endpoint=tf_config['triggerflow']['endpoint'],
+                     user=tf_config['triggerflow']['user'],
+                     password=tf_config['triggerflow']['password'])
     tf.delete_workspace(WORKSPACE)
 
     # es = RedisEventSource(**tf_config['redis'])
