@@ -96,11 +96,7 @@ The following guide provides instructions for a the installation and configurati
         return x + 3
     
     def main(args): # Coordinator function
-        pywren_config = args.get('config')
-        execution_id = args.get('execution_id', None)
-        pw = pywren.ibm_cf_executor(config=args['config'],
-                                    execution_id=args['execution_id'],
-                                    log_level='INFO')
+        pw = pywren.ibm_cf_executor(**args, log_level='INFO')
         res = 0
         pw.call_async(my_function, int(res))
         res = pw.get_result()
@@ -111,7 +107,7 @@ The following guide provides instructions for a the installation and configurati
  3. Deploy and run the coordinator function:
      ```python
      tf_exec = TriggerflowExecutor()
-     tf_exec.run('pywren_tf_test', main)
+     tf_exec.run(main, name='pywren_tf_test')
      ```
 
 Find a complete example in [examples/test_call_async.py](examples/test_call_async.py)

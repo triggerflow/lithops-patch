@@ -25,7 +25,7 @@ class TriggerflowExecutor:
         self.ow_client.create_package('triggerflow')
         logger.info('TriggerflowExecutor created')
 
-    def run(self, name, coordinator_function):
+    def run(self, coordinator_function, name):
         assert coordinator_function.__name__ == 'main', "Coordinator Function must have 'main' name"
 
         file_path = os.path.abspath(inspect.getfile(coordinator_function))
