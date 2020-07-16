@@ -25,3 +25,6 @@ pywren_*.zip
 
 # Jupyter Notebook
 .ipynb_checkpoints
+
+# Config files
+*.yaml

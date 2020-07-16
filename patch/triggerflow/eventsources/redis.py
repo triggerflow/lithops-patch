@@ -8,17 +8,37 @@ logger = logging.getLogger(__name__)
 
 
 class RedisEventSource:
-    def __init__(self, config):
-        self.config = config
+    def __init__(self, config, executor_id):
+        self.executor_id = executor_id
+        self.stream = config['stream']
+        self.name = config['name']
+        self.host = config['host']
+        self.port = config['port']
+        self.password = config['password']
+        self.db = config['db']
+
+    def get_sink_data(self):
+        redis_config = {}
+        redis_config['class'] = 'RedisEventSource'
+        redis_config['name'] = self.name
+        redis_config['parameters'] = {}
+        redis_config['parameters']['host'] = self.host
+        redis_config['parameters']['port'] = self.port
+        redis_config['parameters']['password'] = self.password
+        redis_config['parameters']['db'] = self.db
+        redis_config['parameters']['stream'] = self.stream
+
+        return redis_config
 
     def get_events(self):
         if os.environ.get('PYWREN_FIRST_EXEC') == 'False':
-            logger.info('Event sourcing - Recovering events from redis')
+            logger.info('Event sourcing - Recovering events from redis stream: {}'.format(self.stream))
             to = time.time()
-            redis_client = redis.StrictRedis(**self.config['redis'],
+            redis_client = redis.StrictRedis(host=self.host, port=self.port,
+                                             db=self.db, password=self.password,
                                              charset="utf-8",
                                              decode_responses=True)
-            records = redis_client.xread({'pywren-redis-eventsource': '0'}, block=5)[0][1]
+            records = redis_client.xread({self.stream: '0'}, block=5)[0][1]
             logger.info('Jobs downloaded - TOTAL: {} - TIME: {}s'.format(len(records), round(time.time()-to, 3)))
             if not records:
                 exit()
@@ -33,12 +53,5 @@ class RedisEventSource:
                 if job_id not in event_sourcing_jobs:
                     event_sourcing_jobs[job_id] = []
                 event_sourcing_jobs[job_id].append(data)
-
-        redis_config = {}
-        redis_config['class'] = 'RedisEventSource'
-        redis_config['name'] = 'pywren-redis-eventsource'
-        redis_config['parameters'] = self.config['redis']
-
-        os.environ['__OW_TF_SINK'] = json.dumps(redis_config)
 
         return event_sourcing_jobs

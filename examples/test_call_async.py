@@ -35,10 +35,9 @@ def create_tf_workspace():
     tf.delete_workspace(tf_config['triggerflow']['workspace'])
 
     # es = RedisEventSource(**tf_config['redis'])
-    es = KafkaEventSource(**tf_config['kafka'])
+    es = RedisEventSource(**tf_config['redis'])
 
     tf.create_workspace(workspace=tf_config['triggerflow']['workspace'],
-                        global_context={'ibm_cf': tf_config['ibm_cf']},
                         event_source=es)
 
 

@@ -71,6 +71,7 @@ The following guide provides instructions for a the installation and configurati
         password: G6pSd9mQzeR5Dzuw2JIJjAVZWK6v
         db: 0
         stream: pywren-test-stream
+        name: pywren-test
     ```
     
 

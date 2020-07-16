@@ -129,29 +129,31 @@ class FunctionExecutor:
         self.storage = self.internal_storage.storage
 
         # ------------------ TRIGGERFLOW -------------------
+        self.tf = None
+        self.tf_sink_data = None
+
         if self.event_sourcing:
             sink = self.config['triggerflow']['sink']
             if sink == 'kafka':
-                event_source = KafkaEventSource(self.config)
+                event_source = KafkaEventSource(self.config['kafka'], self.executor_id)
             elif sink == 'redis':
-                event_source = RedisEventSource(self.config)
+                event_source = RedisEventSource(self.config['redis'], self.executor_id)
             elif sink == 'cloudant':
-                event_source = CloudantEventSource(self.config)
+                event_source = CloudantEventSource(self.config['cloudant'], self.executor_id)
             else:
-                event_source = ObjectStorageEventSource(self.config)
+                event_source = ObjectStorageEventSource(self.config['redis'], self.internal_storage, self.executor_id)
 
             self.event_sourcing_jobs = event_source.get_events()
+
             logger.info('Triggerflow - Creating client')
-
-            tf_sink = self.config['triggerflow']['sink']
-            tf_workspace = self.config['triggerflow']['workspace']
-
             self.tf = Triggerflow(endpoint=self.config['triggerflow']['endpoint'],
                                   user=self.config['triggerflow']['user'],
-                                  password=self.config['triggerflow']['password'])
-            self.tf.target_workspace(tf_workspace)
+                                  password=self.config['triggerflow']['password'],
+                                  workspace=self.config['triggerflow']['workspace'])
 
-        self.invoker = FunctionInvoker(self.config, self.executor_id, self.internal_storage, tf_sink, tf_workspace)
+            self.tf_sink_data = event_source.get_sink_data()
+
+        self.invoker = FunctionInvoker(self.config, self.executor_id, self.internal_storage, self.tf_sink_data)
         # --------------------------------------------------
 
         self.futures = []
@@ -226,13 +228,23 @@ class FunctionExecutor:
                         f.result(throw_except=False, internal_storage=self.internal_storage)
 
         if self.event_sourcing and not already_invoked:
-            self.ep.add_trigger(
-                CloudEvent('{}/{}/{}'.format(self.executor_id, job_id, func.__name__)),
+            api_host = os.environ['__OW_API_HOST']
+            action = os.environ['__OW_ACTION_NAME'].split('/', 2)[2]
+            ns = os.environ['__OW_NAMESPACE']
+            subject = '{}/{}/{}'.format(self.executor_id, job_id, func.__name__)
+
+            self.tf.add_trigger(
+                event=CloudEvent().SetEventType('event.triggerflow.termination.success').SetSubject(subject),
                 condition=DefaultConditions.TRUE,
                 action=DefaultActions.IBM_CF_INVOKE,
-                context={'function_args': {'execution_id': self.executor_id.split('/')[0], 'start_time': self.start_time},
-                         'function_url': 'https://us-east.functions.cloud.ibm.com/api/v1/namespaces/_/actions/pywren_event_sourcing',
-                         'kind': 'callasync'}
+                context={'url': '{}/api/v1/namespaces/{}/actions/{}'.format(api_host, ns, action),
+                         'api_key': os.environ['__OW_API_KEY'],
+                         'sink': self.tf_sink_data,
+                         'invoke_kwargs': {'config': self.config,
+                                           'execution_id': self.executor_id.split('/')[0],
+                                           'start_time': self.start_time},
+                         'iter_data': {},
+                         'total_activations': 1}
                 )
             self.invoker.stop()
             del self.invoker
@@ -317,13 +329,23 @@ class FunctionExecutor:
             pool.join()
 
         if self.event_sourcing and not already_invoked:
-            self.ep.add_trigger(
-                CloudEvent('{}/{}/{}'.format(self.executor_id, job_id, map_function.__name__)),
+            api_host = os.environ['__OW_API_HOST']
+            action = os.environ['__OW_ACTION_NAME'].split('/', 2)[2]
+            ns = os.environ['__OW_NAMESPACE']
+            subject = '{}/{}/{}'.format(self.executor_id, job_id, map_function.__name__)
+
+            self.tf.add_trigger(
+                event=CloudEvent().SetEventType('event.triggerflow.termination.success').SetSubject(subject),
                 condition=DefaultConditions.FUNCTION_JOIN,
                 action=DefaultActions.IBM_CF_INVOKE,
-                context={'function_args': {'execution_id': self.executor_id.split('/')[0], 'start_time': self.start_time},
-                         'function_url': 'https://us-east.functions.cloud.ibm.com/api/v1/namespaces/_/actions/pywren_event_sourcing',
-                         'kind': 'callasync', 'total_activations': len(map_iterdata)}
+                context={'url': '{}/api/v1/namespaces/{}/actions/{}'.format(api_host, ns, action),
+                         'api_key': os.environ['__OW_API_KEY'],
+                         'sink': self.tf_sink_data,
+                         'invoke_kwargs': {'config': self.config,
+                                           'execution_id': self.executor_id.split('/')[0],
+                                           'start_time': self.start_time},
+                         'iter_data': {},
+                         'total_activations': len(map_iterdata)}
                 )
             self.invoker.stop()
             del self.invoker
