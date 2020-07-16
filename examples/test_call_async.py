@@ -31,17 +31,18 @@ def create_tf_workspace():
 
     tf = Triggerflow(endpoint=tf_config['triggerflow']['endpoint'],
                      user=tf_config['triggerflow']['user'],
-                     password=tf_config['triggerflow']['password'])
-    tf.delete_workspace(tf_config['triggerflow']['workspace'])
+                     password=tf_config['triggerflow']['password'],
+                     workspace=tf_config['triggerflow']['workspace'])
 
-    # es = RedisEventSource(**tf_config['redis'])
+    try:
+        tf.delete_workspace()
+    except Exception as e:
+        print(e)
     es = RedisEventSource(**tf_config['redis'])
-
-    tf.create_workspace(workspace=tf_config['triggerflow']['workspace'],
-                        event_source=es)
+    tf.create_workspace(workspace_name=tf_config['triggerflow']['workspace'], event_source=es)
 
 
 if __name__ == "__main__":
-    create_tf_workspace()
+    #create_tf_workspace()
     tf_exec = TriggerflowExecutor()
-    tf_exec.run('pywren_tf_test', main)
+    tf_exec.run(main, name='pywren_tf_test')

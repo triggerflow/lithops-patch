@@ -34,12 +34,14 @@ The following guide provides instructions for a the installation and configurati
 
     ```
     git clone https://github.com/triggerflow/pywren-ibm-cloud_tf-patch
-    python pywren-ibm-cloud_tf-patch/install_patch.py
+    cd pywren-ibm-cloud_tf-patch
+    pip install -r requeriments.txt
+    python install_patch.py
     ```
 
 ## Configuration
 
-1. Once installed, you need to create a configuration file for IBM-PyWren. [Follow this instructions](https://github.com/pywren/pywren-ibm-cloud/tree/master/config) to configure an IBM Cloud Functions and IBM Cloud object Storage accounts. It is recommended to place the `pywren_config` file in the root directory of your project that contains the Triggerflow scripts.
+1. Once installed, you need to create a configuration file for IBM-PyWren. [Follow this instructions](https://github.com/pywren/pywren-ibm-cloud/tree/master/config) to configure an IBM Cloud Functions and IBM Cloud object Storage accounts. It is recommended to place the `pywren_config.yaml` file in the root directory of your project that contains the Triggerflow scripts.
 
 2. Edit your pywren config file and add the `triggerflow` section with your access details to your *Triggerflow* deployment. You must provide here the event source service (sink):
     ```yaml
@@ -47,31 +49,31 @@ The following guide provides instructions for a the installation and configurati
         endpoint: http://127.0.0.1:8080
         user: admin
         password: admin
-        workspace: MyPywrenWorkspace
-        sink: kafka
+        workspace: pywren_workspace
+        sink: redis
     ```
 
- 3. Add in your pywren config file the access details to the Triggerflow event source service. In this example kafka:
+ 3. Add in your pywren config file the access details to the Triggerflow event source service. In this example *redis*:
      ```yaml
-     kafka:
-        broker_list: [127.0.0.1:9092]
-        auth_mode: None
-     ```
-
-4. If you configured the triggerflow service with another event source, you must add the access details in the pywren config file, for example:
-    ```yaml
-    cloudant:
-        url: http://127.0.0.1:5984
-        cloudant_user: admin
-        auth_token: admin
-      
-    redis:
+     redis:
         host: 127.0.0.1
         port: 6379
         password: G6pSd9mQzeR5Dzuw2JIJjAVZWK6v
         db: 0
         stream: pywren-test-stream
         name: pywren-test
+     ```
+
+4. If you configured the Triggerflow service with another event source, you must add the access details in the pywren config file, for example:
+    ```yaml
+    kafka:
+        broker_list: [127.0.0.1:9092]
+        auth_mode: None
+
+    cloudant:
+        url: http://127.0.0.1:5984
+        cloudant_user: admin
+        auth_token: admin
     ```
     
 

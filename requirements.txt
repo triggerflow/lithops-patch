@@ -1,0 +1,2 @@
+pywren-ibm-cloud == 1.7.0
+kafka-python
