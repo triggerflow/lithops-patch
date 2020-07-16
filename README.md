@@ -55,6 +55,7 @@ The following guide provides instructions for a the installation and configurati
      ```yaml
      kafka:
         broker_list: [127.0.0.1:9092]
+        auth_mode: None
      ```
 
 4. If you configured the triggerflow service with another event source, you must add the access details in the pywren config file, for example:
@@ -68,6 +69,8 @@ The following guide provides instructions for a the installation and configurati
         host: 127.0.0.1
         port: 6379
         password: G6pSd9mQzeR5Dzuw2JIJjAVZWK6v
+        db: 0
+        stream: pywren-test-stream
     ```
     
 
@@ -82,11 +85,10 @@ The following guide provides instructions for a the installation and configurati
                      user=tf_config['triggerflow']['user'],
                      password=tf_config['triggerflow']['password'])
 
-    kafka_event_source = KafkaEventSource(**tf_config['kafka'])
+    redis_event_source = RedisEventSource(**tf_config['redis'])
 
     tf.create_workspace(workspace=tf_config['triggerflow']['workspace'],
-                        global_context={'ibm_cf': tf_config['ibm_cf']},
-                        event_source=kafka_event_source)
+                        event_source=redis_event_source)
     ```
 
 2. Create the coordinator function, which contains all the PyWren calls, and define your functions:

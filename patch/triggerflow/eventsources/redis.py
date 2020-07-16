@@ -34,10 +34,11 @@ class RedisEventSource:
                     event_sourcing_jobs[job_id] = []
                 event_sourcing_jobs[job_id].append(data)
 
-        redis_config = self.config['redis']
+        redis_config = {}
         redis_config['class'] = 'RedisEventSource'
-        redis_config['stream'] = 'pywren-redis-eventsource'
         redis_config['name'] = 'pywren-redis-eventsource'
+        redis_config['parameters'] = self.config['redis']
+
         os.environ['__OW_TF_SINK'] = json.dumps(redis_config)
 
         return event_sourcing_jobs

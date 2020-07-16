@@ -1,5 +1,5 @@
-from pywren_ibm_cloud.libs.triggerflow import Triggerflow
-from pywren_ibm_cloud.libs.triggerflow.eventsources import KafkaEventSource, RedisEventSource
+from triggerflow import Triggerflow
+from triggerflow.eventsources import KafkaEventSource, RedisEventSource
 from pywren_ibm_cloud.triggerflow import TriggerflowExecutor
 import pywren_ibm_cloud as pywren
 import os

@@ -21,6 +21,8 @@ import time
 import signal
 import logging
 from functools import partial
+from multiprocessing.pool import ThreadPool
+
 from pywren_ibm_cloud.invoker import FunctionInvoker
 from pywren_ibm_cloud.storage import InternalStorage
 from pywren_ibm_cloud.storage.utils import delete_cloudobject
@@ -30,8 +32,8 @@ from pywren_ibm_cloud.config import default_config, extract_storage_config, defa
 from pywren_ibm_cloud.utils import timeout_handler, is_notebook, is_unix_system, is_pywren_function, create_executor_id
 
 from pywren_ibm_cloud.triggerflow.eventsources import KafkaEventSource, RedisEventSource, CloudantEventSource, ObjectStorageEventSource
-from pywren_research.libs.triggerflow import Triggerflow, CloudEvent, DefaultActions, DefaultConditions
-from multiprocessing.pool import ThreadPool
+from triggerflow import Triggerflow, CloudEvent, DefaultActions, DefaultConditions
+
 
 logger = logging.getLogger(__name__)
 

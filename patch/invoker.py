@@ -43,7 +43,7 @@ class FunctionInvoker:
     Module responsible to perform the invocations against the compute backend
     """
 
-    def __init__(self, config, executor_id, internal_storage, tf_sink, tf_workspace):
+    def __init__(self, config, executor_id, internal_storage, tf_sink):
         self.log_level = os.getenv('PYWREN_LOGLEVEL')
         self.config = config
         self.executor_id = executor_id
@@ -54,7 +54,6 @@ class FunctionInvoker:
         self.invokers = []
 
         self.tf_sink = tf_sink
-        self.tf_workspace = tf_workspace
 
         self.remote_invoker = self.config['pywren'].get('remote_invoker', False)
         self.workers = self.config['pywren'].get('workers')
@@ -221,7 +220,7 @@ class FunctionInvoker:
 
         # ------------------ TRIGGERFLOW -------------------
         subject = '{}/{}/{}'.format(job.executor_id, job.job_id, job.func_name)
-        tf_data = {'sink': self.tf_sink, 'workspace': self.tf_workspace, 'subject': subject}
+        tf_data = {'sink': self.tf_sink, 'subject': subject}
         payload.update({'__OW_TRIGGERFLOW': tf_data})
         # --------------------------------------------------
 
