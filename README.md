@@ -65,16 +65,11 @@ The following guide provides instructions for a the installation and configurati
         name: pywren-test
      ```
 
-4. If you configured the Triggerflow service with another event source, you must add the access details in the pywren config file, for example:
+4. If you configured the Triggerflow service with Kafka event source, you must add the access details in the pywren config file, for example:
     ```yaml
     kafka:
         broker_list: [127.0.0.1:9092]
         auth_mode: None
-
-    cloudant:
-        url: http://127.0.0.1:5984
-        cloudant_user: admin
-        auth_token: admin
     ```
     
 

@@ -31,7 +31,7 @@ from pywren_ibm_cloud.job import create_map_job, create_reduce_job, clean_job
 from pywren_ibm_cloud.config import default_config, extract_storage_config, default_logging_config
 from pywren_ibm_cloud.utils import timeout_handler, is_notebook, is_unix_system, is_pywren_function, create_executor_id
 
-from pywren_ibm_cloud.triggerflow.eventsources import KafkaEventSource, RedisEventSource, CloudantEventSource, ObjectStorageEventSource
+from pywren_ibm_cloud.triggerflow.eventsources import KafkaEventSource, RedisEventSource, ObjectStorageEventSource
 from triggerflow import Triggerflow, CloudEvent, DefaultActions, DefaultConditions
 
 
@@ -126,7 +126,6 @@ class FunctionExecutor:
 
         storage_config = extract_storage_config(self.config)
         self.internal_storage = InternalStorage(storage_config)
-        self.storage = self.internal_storage.storage
 
         # ------------------ TRIGGERFLOW -------------------
         self.tf = None
@@ -138,8 +137,6 @@ class FunctionExecutor:
                 event_source = KafkaEventSource(self.config['kafka'], self.executor_id)
             elif sink == 'redis':
                 event_source = RedisEventSource(self.config['redis'], self.executor_id)
-            elif sink == 'cloudant':
-                event_source = CloudantEventSource(self.config['cloudant'], self.executor_id)
             else:
                 event_source = ObjectStorageEventSource(self.config['redis'], self.internal_storage, self.executor_id)
 

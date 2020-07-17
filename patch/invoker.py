@@ -203,6 +203,7 @@ class FunctionInvoker:
         """
         Method used to perform the actual invocation against the Compute Backend
         """
+
         payload = {'config': self.config,
                    'log_level': self.log_level,
                    'func_key': job.func_key,
@@ -219,7 +220,7 @@ class FunctionInvoker:
                    'runtime_memory': job.runtime_memory}
 
         # ------------------ TRIGGERFLOW -------------------
-        subject = '{}/{}/{}'.format(job.executor_id, job.job_id, job.func_name)
+        subject = '{}/{}/{}'.format(job.executor_id, job.job_id, job.function_name)
         tf_data = {'sink': self.tf_sink_data, 'subject': subject}
         payload.update({'__OW_TRIGGERFLOW': tf_data})
         # --------------------------------------------------
@@ -274,7 +275,6 @@ class FunctionInvoker:
         job = SimpleNamespace(**job_description)
 
         if not job.already_invoked:
-
             try:
                 while True:
                     self.token_bucket_q.get_nowait()
