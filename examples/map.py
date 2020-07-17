@@ -17,10 +17,13 @@ def main(args):
 
     pw = pywren.ibm_cf_executor(**args, log_level='INFO')
 
-    res = 0
-    for i in range(5):
-        pw.call_async(my_function, int(res))
-        res = pw.get_result()
+    pw.map(my_function, range(10))
+    res = pw.get_result()
+
+    pw.map(my_function, res)
+    res = pw.get_result()
+
+    print(res)
 
     return {'total_time': time.time()-float(args['start_time'])}
 
@@ -43,6 +46,5 @@ def create_tf_workspace():
 
 
 if __name__ == "__main__":
-    #create_tf_workspace()
     tf_exec = TriggerflowExecutor()
-    tf_exec.run(main, name='pywren_tf_test')
+    tf_exec.run(main, name='triggerflow_pywren_map')

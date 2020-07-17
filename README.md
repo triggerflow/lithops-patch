@@ -27,7 +27,8 @@ The following guide provides instructions for a the installation and configurati
     
     ```
     git clone https://github.com/triggerflow/triggerflow
-    python triggerflow/setup.py install
+    cd triggerflow
+    python setup.py install
     ```
      
 4. Install The Triggerflow patch for IBM-PyWren:
@@ -112,7 +113,7 @@ The following guide provides instructions for a the installation and configurati
  3. Deploy and run the coordinator function:
      ```python
      tf_exec = TriggerflowExecutor()
-     tf_exec.run(main, name='pywren_tf_test')
+     tf_exec.run(main, name='triggerflow_pywren_test')
      ```
 
-Find a complete example in [examples/test_call_async.py](examples/test_call_async.py)
+Find complete examples in [examples/](examples/)

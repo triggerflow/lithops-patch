@@ -11,9 +11,9 @@ from pywren_ibm_cloud.config import default_config
 logger = logging.getLogger(__name__)
 
 
-RUNTIME_DEFAULT = {'3.6': 'triggerflow/ibm-cf-runtime-v3.6',
-                   '3.7': 'triggerflow/ibm-cf-runtime-v3.7',
-                   '3.8': 'triggerflow/ibm-cf-runtime-v3.8:0.1'}
+RUNTIME_DEFAULT = {'3.6': 'triggerflow/ibm_cloud_functions_runtime-v36',
+                   '3.7': 'triggerflow/ibm_cloud_functions_runtime-v37',
+                   '3.8': 'triggerflow/ibm_cloud_functions_runtime-v38'}
 
 
 class TriggerflowExecutor:
