@@ -14,7 +14,6 @@ def my_function(x):
 
 def main(args):
     os.environ['PYWREN_EVENT_SOURCING'] = 'True'
-    os.environ.pop('PYWREN_TOTAL_EXECUTORS', None)
 
     pw = pywren.ibm_cf_executor(**args, log_level='INFO')
     pw.call_async(my_function, 0)
