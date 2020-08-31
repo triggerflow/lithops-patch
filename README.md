@@ -17,10 +17,10 @@ The following guide provides instructions for a the installation and configurati
     $ source tf_env/bin/activate
     ```
 
-2. Install IBM-PyWren library, version 1.7.0:
+2. Install IBM-PyWren library, version 1.7.2:
    
     ```
-    pip install pywren-ibm-cloud==1.7.0
+    pip install pywren-ibm-cloud==1.7.2
     ```
 
 3. Install the Triggerflow library:
