@@ -1,2 +1,2 @@
-pywren-ibm-cloud == 1.7.0
+lithops == 2.2.5
 kafka-python
