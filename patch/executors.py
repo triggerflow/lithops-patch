@@ -1,6 +1,6 @@
 #
-# Copyright 2018 PyWren Team
 # (C) Copyright IBM Corp. 2020
+# (C) Copyright Cloudlab URV 2020
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,117 +15,132 @@
 # limitations under the License.
 #
 
-import os
 import copy
-import time
 import signal
 import logging
+import atexit
+import os
+import pickle
+import tempfile
+import sys
+import time
+import subprocess as sp
 from functools import partial
-from multiprocessing.pool import ThreadPool
+from concurrent.futures import ThreadPoolExecutor
 
-from pywren_ibm_cloud.invoker import FunctionInvoker
-from pywren_ibm_cloud.storage import InternalStorage
-from pywren_ibm_cloud.storage.utils import delete_cloudobject
-from pywren_ibm_cloud.wait import wait_storage, wait_rabbitmq, ALL_COMPLETED
-from pywren_ibm_cloud.job import create_map_job, create_reduce_job, clean_job
-from pywren_ibm_cloud.config import default_config, extract_storage_config, default_logging_config
-from pywren_ibm_cloud.utils import timeout_handler, is_notebook, is_unix_system, is_pywren_function, create_executor_id
+from lithops.invokers import ServerlessInvoker, StandaloneInvoker
+from lithops.storage import InternalStorage
+from lithops.wait import wait_storage, wait_rabbitmq, ALL_COMPLETED
+from lithops.job import create_map_job, create_reduce_job
+from lithops.config import default_config, extract_storage_config, \
+    extract_localhost_config, extract_standalone_config, \
+    extract_serverless_config
+from lithops.constants import LOCALHOST, SERVERLESS, STANDALONE, CLEANER_DIR,\
+    CLEANER_LOG_FILE
+from lithops.utils import timeout_handler, is_notebook, setup_logger, \
+    is_unix_system, is_lithops_worker, create_executor_id
+from lithops.localhost.localhost import LocalhostHandler
+from lithops.standalone.standalone import StandaloneHandler
+from lithops.serverless.serverless import ServerlessHandler
+from lithops.storage.utils import create_job_key
 
-from pywren_ibm_cloud.triggerflow.eventsources import KafkaEventSource, RedisEventSource, ObjectStorageEventSource
+from lithops.triggerflow.eventsources import KafkaEventSource, RedisEventSource, ObjectStorageEventSource
 from triggerflow import Triggerflow, CloudEvent, DefaultActions, DefaultConditions
-
 
 logger = logging.getLogger(__name__)
 
 
 class FunctionExecutor:
+    """
+    Executor abstract class that contains the common logic
+    for the Localhost, Serverless and Standalone executors
+    """
 
-    def __init__(self, config=None, execution_id=None, runtime=None, runtime_memory=None, compute_backend=None,
-                 compute_backend_region=None, storage_backend=None, storage_backend_region=None,
-                 workers=None, rabbitmq_monitor=None, remote_invoker=None, log_level=None, start_time=0):
-        """
-        Initialize a FunctionExecutor class.
+    def __init__(self, type=None, session_id=None, mode=None, config=None, backend=None,
+                 storage=None, runtime=None, runtime_memory=None, rabbitmq_monitor=None,
+                 workers=None, remote_invoker=None, log_level=None, start_time=0):
 
-        :param config: Settings passed in here will override those in config file. Default None.
-        :param runtime: Runtime name to use. Default None.
-        :param runtime_memory: memory to use in the runtime. Default None.
-        :param compute_backend: Name of the compute backend to use. Default None.
-        :param compute_backend_region: Name of the compute backend region to use. Default None.
-        :param storage_backend: Name of the storage backend to use. Default None.
-        :param storage_backend_region: Name of the storage backend region to use. Default None.
-        :param workers: Max number of concurrent workers.
-        :param rabbitmq_monitor: use rabbitmq as the monitoring system. Default None.
-        :param log_level: log level to use during the execution. Default None.
-
-        :return `FunctionExecutor` object.
-        """
-        self.is_pywren_function = is_pywren_function()
-
-        # ------------------ TRIGGERFLOW -------------------
-        if execution_id:
-            logger.info('Got Execution ID: {}'.format(execution_id))
-            os.environ['PYWREN_EXECUTION_ID'] = execution_id
-            os.environ['PYWREN_FIRST_EXEC'] = 'False'
+                # ------------------ TRIGGERFLOW -------------------
+        if session_id:
+            logger.info('Got Session ID: {}'.format(session_id))
+            os.environ['__LITHOPS_SESSION_ID'] = session_id
+            os.environ['LITHOPS_FIRST_EXEC'] = 'False'
         else:
-            os.environ['PYWREN_FIRST_EXEC'] = 'True'
-            os.environ.pop('PYWREN_EXECUTION_ID', None)
+            os.environ['LITHOPS_FIRST_EXEC'] = 'True'
+            os.environ.pop('__LITHOPS_SESSION_ID', None)
 
         if start_time == 0:
             self.start_time = str(time.time())
         else:
             self.start_time = start_time
 
-        self.event_sourcing = eval(os.environ.get('PYWREN_EVENT_SOURCING', 'False'))
+        self.event_sourcing = eval(os.environ.get('LITHOPS_EVENT_SOURCING', 'False'))
         # --------------------------------------------------
 
-        # Log level Configuration
-        self.log_level = log_level
-        if not self.log_level:
-            if(logger.getEffectiveLevel() != logging.WARNING):
-                self.log_level = logging.getLevelName(logger.getEffectiveLevel())
-        if self.log_level:
-            os.environ["PYWREN_LOGLEVEL"] = self.log_level
-            if not self.is_pywren_function:
-                default_logging_config(self.log_level)
+        mode = mode or type
 
-        # Overwrite pywren config parameters
-        pw_config_ow = {}
+        if mode is None:
+            config = default_config(copy.deepcopy(config))
+            mode = config['lithops']['mode']
+
+        if mode not in [LOCALHOST, SERVERLESS, STANDALONE]:
+            raise Exception("Function executor mode must be one of '{}', '{}' "
+                            "or '{}'".format(LOCALHOST, SERVERLESS, STANDALONE))
+
+        if log_level:
+            setup_logger(log_level)
+
+        if type is not None:
+            logger.warning("'type' parameter is deprecated and it will be removed"
+                           "in future releases. Use 'mode' parameter instead")
+
+        config_ow = {'lithops': {'mode': mode}, mode: {}}
+
         if runtime is not None:
-            pw_config_ow['runtime'] = runtime
+            config_ow[mode]['runtime'] = runtime
+        if backend is not None:
+            config_ow[mode]['backend'] = backend
         if runtime_memory is not None:
-            pw_config_ow['runtime_memory'] = int(runtime_memory)
-        if compute_backend is not None:
-            pw_config_ow['compute_backend'] = compute_backend
-        if compute_backend_region is not None:
-            pw_config_ow['compute_backend_region'] = compute_backend_region
-        if storage_backend is not None:
-            pw_config_ow['storage_backend'] = storage_backend
-        if storage_backend_region is not None:
-            pw_config_ow['storage_backend_region'] = storage_backend_region
-        if workers is not None:
-            pw_config_ow['workers'] = workers
-        if rabbitmq_monitor is not None:
-            pw_config_ow['rabbitmq_monitor'] = rabbitmq_monitor
+            config_ow[mode]['runtime_memory'] = int(runtime_memory)
         if remote_invoker is not None:
-            pw_config_ow['remote_invoker'] = remote_invoker
+            config_ow[mode]['remote_invoker'] = remote_invoker
 
-        self.config = default_config(copy.deepcopy(config), pw_config_ow)
+        if storage is not None:
+            config_ow['lithops']['storage'] = storage
+        if workers is not None:
+            config_ow['lithops']['workers'] = workers
+        if rabbitmq_monitor is not None:
+            config_ow['lithops']['rabbitmq_monitor'] = rabbitmq_monitor
 
+        self.config = default_config(copy.deepcopy(config), config_ow)
+
+        self.log_active = logger.getEffectiveLevel() != logging.WARNING
+        self.is_lithops_worker = is_lithops_worker()
         self.executor_id = create_executor_id()
-        logger.debug('FunctionExecutor created with ID: {}'.format(self.executor_id))
 
-        self.data_cleaner = self.config['pywren'].get('data_cleaner', True)
-        self.rabbitmq_monitor = self.config['pywren'].get('rabbitmq_monitor', False)
+        self.data_cleaner = self.config['lithops'].get('data_cleaner', True)
+        if self.data_cleaner and not self.is_lithops_worker:
+            spawn_cleaner = int(self.executor_id.split('-')[1]) == 0
+            atexit.register(self.clean, spawn_cleaner=spawn_cleaner,
+                            clean_cloudobjects=False)
+
+        self.rabbitmq_monitor = self.config['lithops'].get('rabbitmq_monitor', False)
 
         if self.rabbitmq_monitor:
             if 'rabbitmq' in self.config and 'amqp_url' in self.config['rabbitmq']:
                 self.rabbit_amqp_url = self.config['rabbitmq'].get('amqp_url')
             else:
-                raise Exception("You cannot use rabbitmq_mnonitor since 'amqp_url'"
-                                " is not present in configuration")
+                raise Exception("You cannot use rabbitmq_mnonitor since "
+                                "'amqp_url' is not present in configuration")
 
         storage_config = extract_storage_config(self.config)
         self.internal_storage = InternalStorage(storage_config)
+        self.storage = self.internal_storage.storage
+
+        self.futures = []
+        self.cleaned_jobs = set()
+        self.total_jobs = 0
+        self.last_call = None
 
         # ------------------ TRIGGERFLOW -------------------
         self.tf = None
@@ -149,14 +164,39 @@ class FunctionExecutor:
                                   workspace=self.config['triggerflow']['workspace'])
 
             self.tf_sink_data = event_source.get_sink_data()
-
-        self.invoker = FunctionInvoker(self.config, self.executor_id, self.internal_storage, self.tf_sink_data)
         # --------------------------------------------------
 
-        self.futures = []
-        self.total_jobs = 0
-        self.cleaned_jobs = set()
-        self.last_call = None
+        if mode == LOCALHOST:
+            localhost_config = extract_localhost_config(self.config)
+            self.compute_handler = LocalhostHandler(localhost_config)
+
+            self.invoker = StandaloneInvoker(self.config,
+                                             self.executor_id,
+                                             self.internal_storage,
+                                             self.compute_handler,
+                                             self.tf_sink_data)
+        elif mode == SERVERLESS:
+            serverless_config = extract_serverless_config(self.config)
+            self.compute_handler = ServerlessHandler(serverless_config,
+                                                     storage_config)
+
+            self.invoker = ServerlessInvoker(self.config,
+                                             self.executor_id,
+                                             self.internal_storage,
+                                             self.compute_handler,
+                                             self.tf_sink_data)
+        elif mode == STANDALONE:
+            standalone_config = extract_standalone_config(self.config)
+            self.compute_handler = StandaloneHandler(standalone_config)
+
+            self.invoker = StandaloneInvoker(self.config,
+                                             self.executor_id,
+                                             self.internal_storage,
+                                             self.compute_handler,
+                                             self.tf_sink_data)
+
+        logger.info('{} Executor created with ID: {}'
+                    .format(mode.capitalize(), self.executor_id))
 
     def __enter__(self):
         return self
@@ -173,12 +213,13 @@ class FunctionExecutor:
 
         :param func: the function to map over the data
         :param data: input data
-        :param extra_data: Additional data to pass to action. Default None.
-        :param extra_env: Additional environment variables for action environment. Default None.
-        :param runtime_memory: Memory to use to run the function. Default None (loaded from config).
-        :param timeout: Time that the functions have to complete their execution before raising a timeout.
-        :param include_modules: Explicitly pickle these dependencies.
-        :param exclude_modules: Explicitly keep these modules from pickled dependencies.
+        :param extra_env: Additional env variables for action environment
+        :param runtime_memory: Memory to use to run the function
+        :param timeout: Time that the functions have to complete their
+                        execution before raising a timeout
+        :param include_modules: Explicitly pickle these dependencies
+        :param exclude_modules: Explicitly keep these modules from pickled
+                                dependencies
 
         :return: future object.
         """
@@ -199,17 +240,13 @@ class FunctionExecutor:
         if not already_invoked:
             runtime_meta = self.invoker.select_runtime(job_id, runtime_memory)
 
-        extra_env_vars = {'STORE_STATUS': False}
-        if extra_env:
-            extra_env_vars.update(extra_env)
-
         job = create_map_job(self.config, self.internal_storage,
                              self.executor_id, job_id,
                              map_function=func,
                              iterdata=[data],
                              runtime_meta=runtime_meta,
                              runtime_memory=runtime_memory,
-                             extra_env=extra_env_vars,
+                             extra_env=extra_env,
                              include_modules=include_modules,
                              exclude_modules=exclude_modules,
                              execution_timeout=timeout,
@@ -252,24 +289,29 @@ class FunctionExecutor:
 
         return futures[0]
 
-    def map(self, map_function, map_iterdata, extra_args=None, extra_env=None, runtime_memory=None,
-            chunk_size=None, chunk_n=None, timeout=None, invoke_pool_threads=500,
-            include_modules=[], exclude_modules=[]):
+    def map(self, map_function, map_iterdata, extra_args=None, extra_env=None,
+            runtime_memory=None, chunk_size=None, chunk_n=None, timeout=None,
+            invoke_pool_threads=500, include_modules=[], exclude_modules=[]):
         """
+        For running multiple function executions asynchronously
+
         :param map_function: the function to map over the data
         :param map_iterdata: An iterable of input data
-        :param extra_args: Additional arguments to pass to the function activation. Default None.
-        :param extra_env: Additional environment variables for action environment. Default None.
-        :param runtime_memory: Memory to use to run the function. Default None (loaded from config).
-        :param chunk_size: the size of the data chunks to split each object. 'None' for processing
-                           the whole file in one function activation.
-        :param chunk_n: Number of chunks to split each object. 'None' for processing the whole
-                        file in one function activation.
-        :param remote_invocation: Enable or disable remote_invocation mechanism. Default 'False'
-        :param timeout: Time that the functions have to complete their execution before raising a timeout.
-        :param invoke_pool_threads: Number of threads to use to invoke.
-        :param include_modules: Explicitly pickle these dependencies.
-        :param exclude_modules: Explicitly keep these modules from pickled dependencies.
+        :param extra_args: Additional args to pass to the function activations
+        :param extra_env: Additional env variables for action environment
+        :param runtime_memory: Memory to use to run the function
+        :param chunk_size: the size of the data chunks to split each object.
+                           'None' for processing the whole file in one function
+                           activation.
+        :param chunk_n: Number of chunks to split each object. 'None' for
+                        processing the whole file in one function activation
+        :param remote_invocation: Enable or disable remote_invocation mechanism
+        :param timeout: Time that the functions have to complete their execution
+                        before raising a timeout
+        :param invoke_pool_threads: Number of threads to use to invoke
+        :param include_modules: Explicitly pickle these dependencies
+        :param exclude_modules: Explicitly keep these modules from pickled
+                                dependencies
 
         :return: A list with size `len(iterdata)` of futures.
         """
@@ -292,7 +334,7 @@ class FunctionExecutor:
 
         extra_env_vars = {'STORE_STATUS': False}
         if extra_env:
-            extra_env_vars.update(extra_env)
+            extra_env.update(extra_env_vars)
 
         job = create_map_job(self.config, self.internal_storage,
                              self.executor_id, job_id,
@@ -300,27 +342,28 @@ class FunctionExecutor:
                              iterdata=map_iterdata,
                              runtime_meta=runtime_meta,
                              runtime_memory=runtime_memory,
-                             extra_params=extra_env_vars,
                              extra_env=extra_env,
-                             obj_chunk_size=chunk_size,
-                             obj_chunk_number=chunk_n,
-                             invoke_pool_threads=invoke_pool_threads,
                              include_modules=include_modules,
                              exclude_modules=exclude_modules,
                              execution_timeout=timeout,
+                             extra_args=extra_args,
+                             obj_chunk_size=chunk_size,
+                             obj_chunk_number=chunk_n,
+                             invoke_pool_threads=invoke_pool_threads,
                              already_invoked=already_invoked)
 
         def get_result(f):
             f.result(throw_except=False, internal_storage=self.internal_storage)
 
         futures = self.invoker.run(job)
+
         if already_invoked:
             for f in futures:
                 for call_status in self.event_sourcing_jobs[job_id]:
                     if f.call_id == call_status['call_id']:
                         f._call_status = call_status
 
-            pool = ThreadPool(128)
+            pool = ThreadPoolExecutor(128)
             pool.map(get_result, futures)
             pool.close()
             pool.join()
@@ -353,8 +396,9 @@ class FunctionExecutor:
 
         return futures
 
-    def map_reduce(self, map_function, map_iterdata, reduce_function, extra_args=None, extra_env=None,
-                   map_runtime_memory=None, reduce_runtime_memory=None, chunk_size=None, chunk_n=None,
+    def map_reduce(self, map_function, map_iterdata, reduce_function,
+                   extra_args=None, extra_env=None, map_runtime_memory=None,
+                   reduce_runtime_memory=None, chunk_size=None, chunk_n=None,
                    timeout=None, invoke_pool_threads=500, reducer_one_per_object=False,
                    reducer_wait_local=False, include_modules=[], exclude_modules=[]):
         """
@@ -362,7 +406,7 @@ class FunctionExecutor:
         This method is executed all within CF.
 
         :param map_function: the function to map over the data
-        :param map_iterdata:  the function to reduce over the futures
+        :param map_iterdata:  An iterable of input data
         :param reduce_function:  the function to reduce over the futures
         :param extra_env: Additional environment variables for action environment. Default None.
         :param extra_args: Additional arguments to pass to function activation. Default None.
@@ -382,8 +426,8 @@ class FunctionExecutor:
 
         :return: A list with size `len(map_iterdata)` of futures.
         """
-        map_job_id = self._create_job_id('M')
         self.last_call = 'map_reduce'
+        map_job_id = self._create_job_id('M')
 
         runtime_meta = self.invoker.select_runtime(map_job_id, map_runtime_memory)
 
@@ -397,10 +441,10 @@ class FunctionExecutor:
                                  extra_env=extra_env,
                                  obj_chunk_size=chunk_size,
                                  obj_chunk_number=chunk_n,
-                                 invoke_pool_threads=invoke_pool_threads,
                                  include_modules=include_modules,
                                  exclude_modules=exclude_modules,
-                                 execution_timeout=timeout)
+                                 execution_timeout=timeout,
+                                 invoke_pool_threads=invoke_pool_threads)
 
         map_futures = self.invoker.run(map_job)
         self.futures.extend(map_futures)
@@ -416,8 +460,8 @@ class FunctionExecutor:
                                        self.executor_id, reduce_job_id,
                                        reduce_function, map_job, map_futures,
                                        runtime_meta=runtime_meta,
-                                       reducer_one_per_object=reducer_one_per_object,
                                        runtime_memory=reduce_runtime_memory,
+                                       reducer_one_per_object=reducer_one_per_object,
                                        extra_env=extra_env,
                                        include_modules=include_modules,
                                        exclude_modules=exclude_modules)
@@ -431,8 +475,9 @@ class FunctionExecutor:
 
         return map_futures + reduce_futures
 
-    def wait(self, fs=None, throw_except=True, return_when=ALL_COMPLETED, download_results=False,
-             timeout=None, THREADPOOL_SIZE=128, WAIT_DUR_SEC=1):
+    def wait(self, fs=None, throw_except=True, return_when=ALL_COMPLETED,
+             download_results=False, timeout=None, THREADPOOL_SIZE=128,
+             WAIT_DUR_SEC=1):
         """
         Wait for the Future instances (possibly created by different Executor instances)
         given by fs to complete. Returns a named 2-tuple of sets. The first set, named done,
@@ -475,7 +520,9 @@ class FunctionExecutor:
         if not fs_not_done:
             return fs_done, fs_not_done
 
-        print(msg) if not self.log_level else logger.info(msg)
+        logger.info(msg)
+        if not self.log_active:
+            print(msg)
 
         if is_unix_system() and timeout is not None:
             logger.debug('Setting waiting timeout to {} seconds'.format(timeout))
@@ -485,7 +532,7 @@ class FunctionExecutor:
 
         pbar = None
         error = False
-        if not self.is_pywren_function and not self.log_level:
+        if not self.is_lithops_worker and not self.log_active:
             from tqdm.auto import tqdm
 
             if is_notebook():
@@ -505,7 +552,7 @@ class FunctionExecutor:
                              throw_except=throw_except, return_when=return_when, pbar=pbar,
                              THREADPOOL_SIZE=THREADPOOL_SIZE, WAIT_DUR_SEC=WAIT_DUR_SEC)
 
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as e:
             if download_results:
                 not_dones_call_ids = [(f.job_id, f.call_id) for f in futures if not f.done]
             else:
@@ -515,8 +562,11 @@ class FunctionExecutor:
             if pbar:
                 pbar.close()
                 print()
-            print(msg) if not self.log_level else logger.info(msg)
+            logger.info(msg)
+            if not self.log_active:
+                print(msg)
             error = True
+            raise e
 
         except Exception as e:
             error = True
@@ -530,8 +580,8 @@ class FunctionExecutor:
                 pbar.close()
                 if not is_notebook():
                     print()
-            if self.data_cleaner and not self.is_pywren_function:
-                self.clean(cloudobjects=False, force=False, log=False)
+            if self.data_cleaner and not self.is_lithops_worker:
+                self.clean(clean_cloudobjects=False)
             if not fs and error and is_notebook():
                 del self.futures[len(self.futures)-len(futures):]
 
@@ -544,7 +594,8 @@ class FunctionExecutor:
 
         return fs_done, fs_notdone
 
-    def get_result(self, fs=None, throw_except=True, timeout=None, THREADPOOL_SIZE=128, WAIT_DUR_SEC=1):
+    def get_result(self, fs=None, throw_except=True, timeout=None,
+                   THREADPOOL_SIZE=128, WAIT_DUR_SEC=1):
         """
         For getting the results from all function activations
 
@@ -557,22 +608,25 @@ class FunctionExecutor:
 
         :return: The result of the future/s
         """
-        fs_done, unused_fs_notdone = self.wait(fs=fs, throw_except=throw_except,
-                                               timeout=timeout, download_results=True,
-                                               THREADPOOL_SIZE=THREADPOOL_SIZE,
-                                               WAIT_DUR_SEC=WAIT_DUR_SEC)
+        fs_done, _ = self.wait(fs=fs, throw_except=throw_except,
+                               timeout=timeout, download_results=True,
+                               THREADPOOL_SIZE=THREADPOOL_SIZE,
+                               WAIT_DUR_SEC=WAIT_DUR_SEC)
         result = []
         fs_done = [f for f in fs_done if not f.futures and f._produce_output]
         for f in fs_done:
             if fs:
                 # Process futures provided by the user
-                result.append(f.result(throw_except=throw_except, internal_storage=self.internal_storage))
+                result.append(f.result(throw_except=throw_except,
+                                       internal_storage=self.internal_storage))
             elif not fs and not f._read:
                 # Process internally stored futures
-                result.append(f.result(throw_except=throw_except, internal_storage=self.internal_storage))
+                result.append(f.result(throw_except=throw_except,
+                                       internal_storage=self.internal_storage))
                 f._read = True
 
-        logger.debug("ExecutorID {} Finished getting results".format(self.executor_id))
+        logger.debug("ExecutorID {} Finished getting results"
+                     .format(self.executor_id))
 
         if len(result) == 1 and self.last_call != 'map':
             return result[0]
@@ -595,54 +649,142 @@ class FunctionExecutor:
         ftrs_to_plot = [f for f in ftrs if (f.ready or f.done) and not f.error]
 
         if not ftrs_to_plot:
-            logger.debug('ExecutorID {} - No futures ready to plot'.format(self.executor_id))
+            logger.debug('ExecutorID {} - No futures ready to plot'
+                         .format(self.executor_id))
             return
 
         logging.getLogger('matplotlib').setLevel(logging.WARNING)
-        from pywren_ibm_cloud.plots import create_timeline, create_histogram
+        from lithops.plots import create_timeline, create_histogram
 
         msg = 'ExecutorID {} - Creating execution plots'.format(self.executor_id)
-        print(msg) if not self.log_level else logger.info(msg)
+
+        logger.info(msg)
+        if not self.log_active:
+            print(msg)
 
         create_timeline(ftrs_to_plot, dst)
         create_histogram(ftrs_to_plot, dst)
 
-    def clean(self, fs=None, cs=None, cloudobjects=True, force=True, log=True):
+    def clean(self, fs=None, cs=None, clean_cloudobjects=True, spawn_cleaner=True):
         """
-        Deletes all the files from COS. These files include the function,
-        the data serialization and the function invocation results.
+        Deletes all the temp files from storage. These files include the function,
+        the data serialization and the function invocation results. It can also clean
+        cloudobjects.
+
+        :param fs: list of futures to clean
+        :param cs: list of cloudobjects to clean
+        :param clean_cloudobjects: true/false
+        :param spawn_cleaner true/false
         """
+
+        os.makedirs(CLEANER_DIR, exist_ok=True)
+
+        def save_data_to_clean(data):
+            with tempfile.NamedTemporaryFile(dir=CLEANER_DIR, delete=False) as temp:
+                pickle.dump(data, temp)
+
         if cs:
-            storage_config = self.internal_storage.get_storage_config()
-            delete_cloudobject(list(cs), storage_config)
+            data = {'cos_to_clean': list(cs),
+                    'storage_config': self.internal_storage.get_storage_config()}
+            save_data_to_clean(data)
             if not fs:
                 return
 
-        futures = self.futures if not fs else fs
-        if type(futures) != list:
-            futures = [futures]
-
-        if not futures:
-            logger.debug('ExecutorID {} - No jobs to clean'.format(self.executor_id))
-            return
-
-        if fs or force:
-            present_jobs = {(f.executor_id, f.job_id) for f in futures
-                            if f.executor_id.count('/') == 1}
-            jobs_to_clean = present_jobs
-        else:
-            present_jobs = {(f.executor_id, f.job_id) for f in futures
-                            if f.done and f.executor_id.count('/') == 1}
-            jobs_to_clean = present_jobs - self.cleaned_jobs
+        futures = fs or self.futures
+        futures = [futures] if type(futures) != list else futures
+        present_jobs = {create_job_key(f.executor_id, f.job_id) for f in futures
+                        if f.executor_id.count('-') == 1}
+        jobs_to_clean = present_jobs - self.cleaned_jobs
 
         if jobs_to_clean:
-            msg = "ExecutorID {} - Cleaning temporary data".format(self.executor_id)
-            print(msg) if not self.log_level and log else logger.info(msg)
-            storage_config = self.internal_storage.get_storage_config()
-            clean_job(jobs_to_clean, storage_config, clean_cloudobjects=cloudobjects)
+            logger.info("ExecutorID {} - Cleaning temporary data"
+                        .format(self.executor_id))
+            data = {'jobs_to_clean': jobs_to_clean,
+                    'clean_cloudobjects': clean_cloudobjects,
+                    'storage_config': self.internal_storage.get_storage_config()}
+            save_data_to_clean(data)
             self.cleaned_jobs.update(jobs_to_clean)
+
+        if (jobs_to_clean or cs) and spawn_cleaner:
+            log_file = open(CLEANER_LOG_FILE, 'a')
+            cmdstr = '{} -m lithops.scripts.cleaner'.format(sys.executable)
+            sp.Popen(cmdstr, shell=True, stdout=log_file, stderr=log_file)
+
+    def dismantle(self):
+        self.compute_handler.dismantle()
+
+    def init(self):
+        self.compute_handler.init()
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.invoker.stop()
-        if self.data_cleaner:
-            self.clean(log=False)
+
+
+class LocalhostExecutor(FunctionExecutor):
+
+    def __init__(self, config=None, runtime=None, workers=None,
+                 storage=None, rabbitmq_monitor=None, log_level=None):
+        """
+        Initialize a LocalhostExecutor class.
+
+        :param config: Settings passed in here will override those in config file.
+        :param runtime: Runtime name to use.
+        :param storage: Name of the storage backend to use.
+        :param workers: Max number of concurrent workers.
+        :param rabbitmq_monitor: use rabbitmq as the monitoring system.
+        :param log_level: log level to use during the execution.
+
+        :return `LocalhostExecutor` object.
+        """
+        super().__init__(mode=LOCALHOST, config=config,
+                         runtime=runtime, storage=storage,
+                         log_level=log_level, workers=workers,
+                         rabbitmq_monitor=rabbitmq_monitor)
+
+
+class ServerlessExecutor(FunctionExecutor):
+
+    def __init__(self, config=None, runtime=None, runtime_memory=None,
+                 backend=None, storage=None, workers=None, rabbitmq_monitor=None,
+                 remote_invoker=None, log_level=None):
+        """
+        Initialize a ServerlessExecutor class.
+
+        :param config: Settings passed in here will override those in config file.
+        :param runtime: Runtime name to use.
+        :param runtime_memory: memory to use in the runtime.
+        :param backend: Name of the serverless compute backend to use.
+        :param storage: Name of the storage backend to use.
+        :param workers: Max number of concurrent workers.
+        :param rabbitmq_monitor: use rabbitmq as the monitoring system.
+        :param log_level: log level to use during the execution.
+
+        :return `ServerlessExecutor` object.
+        """
+        super().__init__(mode=SERVERLESS, config=config, runtime=runtime,
+                         runtime_memory=runtime_memory, backend=backend,
+                         storage=storage, workers=workers,
+                         rabbitmq_monitor=rabbitmq_monitor, log_level=log_level,
+                         remote_invoker=remote_invoker)
+
+
+class StandaloneExecutor(FunctionExecutor):
+
+    def __init__(self, config=None, backend=None, runtime=None, storage=None,
+                 workers=None, rabbitmq_monitor=None, log_level=None):
+        """
+        Initialize a StandaloneExecutor class.
+
+        :param config: Settings passed in here will override those in config file.
+        :param runtime: Runtime name to use.
+        :param backend: Name of the standalone compute backend to use.
+        :param storage: Name of the storage backend to use.
+        :param workers: Max number of concurrent workers.
+        :param rabbitmq_monitor: use rabbitmq as the monitoring system.
+        :param log_level: log level to use during the execution.
+
+        :return `StandaloneExecutor` object.
+        """
+        super().__init__(mode=STANDALONE, config=config, runtime=runtime,
+                         backend=backend, storage=storage, workers=workers,
+                         rabbitmq_monitor=rabbitmq_monitor, log_level=log_level)

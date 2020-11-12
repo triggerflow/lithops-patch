@@ -15,83 +15,89 @@
 # limitations under the License.
 #
 
-import os
-import sys
+
 import time
-import textwrap
 import pickle
 import logging
-import tempfile
-from pywren_ibm_cloud import utils
-from pywren_ibm_cloud.job.partitioner import create_partitions
-from pywren_ibm_cloud.utils import is_object_processing_function, sizeof_fmt
-from pywren_ibm_cloud.storage.utils import create_func_key, create_agg_data_key
-from pywren_ibm_cloud.job.serialize import SerializeIndependent, create_module_data
-from pywren_ibm_cloud.config import MAX_AGG_DATA_SIZE, JOBS_PREFIX
+from lithops import utils
+from lithops.job.partitioner import create_partitions
+from lithops.utils import is_object_processing_function, sizeof_fmt
+from lithops.storage.utils import create_func_key, create_agg_data_key
+from lithops.job.serialize import SerializeIndependent, create_module_data
+from lithops.constants import MAX_AGG_DATA_SIZE, JOBS_PREFIX, LOCALHOST,\
+    SERVERLESS, STANDALONE
+from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
 
 
-def create_map_job(config, internal_storage, executor_id, job_id, map_function, iterdata, runtime_meta,
-                   runtime_memory=None, extra_args=None, extra_env=None, obj_chunk_size=None,
-                   obj_chunk_number=None, invoke_pool_threads=128, include_modules=[], exclude_modules=[],
-                   execution_timeout=None, already_invoked=False):
+def create_map_job(config, internal_storage, executor_id, job_id, map_function,
+                   iterdata, runtime_meta, runtime_memory, extra_env,
+                   include_modules, exclude_modules, execution_timeout,
+                   extra_args=None,  obj_chunk_size=None, obj_chunk_number=None,
+                   invoke_pool_threads=128, already_invoked=False):
     """
     Wrapper to create a map job.  It integrates COS logic to process objects.
     """
-    job_created_tstamp = time.time()
-    map_func = map_function
-    map_iterdata = utils.verify_args(map_function, iterdata, extra_args)
-    new_invoke_pool_threads = invoke_pool_threads
-    new_runtime_memory = runtime_memory
 
-    if config['pywren'].get('rabbitmq_monitor', False):
+    host_job_meta = {'host_job_create_tstamp': time.time()}
+    map_iterdata = utils.verify_args(map_function, iterdata, extra_args)
+
+    if config['lithops'].get('rabbitmq_monitor', False):
         rabbit_amqp_url = config['rabbitmq'].get('amqp_url')
         utils.create_rabbitmq_resources(rabbit_amqp_url, executor_id, job_id)
 
     # Object processing functionality
     parts_per_object = None
     if is_object_processing_function(map_function):
+        create_partitions_start = time.time()
         # Create partitions according chunk_size or chunk_number
         logger.debug('ExecutorID {} | JobID {} - Calling map on partitions '
                      'from object storage flow'.format(executor_id, job_id))
         map_iterdata, parts_per_object = create_partitions(config, internal_storage,
                                                            map_iterdata, obj_chunk_size,
                                                            obj_chunk_number)
+        host_job_meta['host_job_create_partitions_time'] = round(time.time()-create_partitions_start, 6)
     # ########
 
-    job_description = _create_job(config, internal_storage, executor_id,
-                                  job_id, map_func, map_iterdata,
-                                  runtime_meta=runtime_meta,
-                                  runtime_memory=new_runtime_memory,
-                                  extra_env=extra_env,
-                                  invoke_pool_threads=new_invoke_pool_threads,
-                                  include_modules=include_modules,
-                                  exclude_modules=exclude_modules,
-                                  execution_timeout=execution_timeout,
-                                  job_created_tstamp=job_created_tstamp,
-                                  already_invoked=already_invoked)
+    job = _create_job(config=config,
+                      internal_storage=internal_storage,
+                      executor_id=executor_id,
+                      job_id=job_id,
+                      func=map_function,
+                      iterdata=map_iterdata,
+                      runtime_meta=runtime_meta,
+                      runtime_memory=runtime_memory,
+                      extra_env=extra_env,
+                      include_modules=include_modules,
+                      exclude_modules=exclude_modules,
+                      execution_timeout=execution_timeout,
+                      host_job_meta=host_job_meta,
+                      invoke_pool_threads=invoke_pool_threads,
+                      already_invoked=already_invoked)
 
     if parts_per_object:
-        job_description['parts_per_object'] = parts_per_object
+        job.parts_per_object = parts_per_object
 
-    return job_description
+    return job
 
 
-def create_reduce_job(config, internal_storage, executor_id, reduce_job_id, reduce_function,
-                      map_job, map_futures, runtime_meta, reducer_one_per_object=False,
-                      runtime_memory=None, extra_env=None, include_modules=[], exclude_modules=[],
-                      execution_timeout=None, already_invoked=False):
+def create_reduce_job(config, internal_storage, executor_id, reduce_job_id,
+                      reduce_function, map_job, map_futures, runtime_meta,
+                      runtime_memory, reducer_one_per_object, extra_env,
+                      include_modules, exclude_modules, execution_timeout=None,
+                      already_invoked=False):
     """
     Wrapper to create a reduce job. Apply a function across all map futures.
     """
-    job_created_tstamp = time.time()
+    host_job_meta = {'host_job_create_tstamp': time.time()}
+
     iterdata = [[map_futures, ]]
 
-    if 'parts_per_object' in map_job and reducer_one_per_object:
+    if hasattr(map_job, 'parts_per_object') and reducer_one_per_object:
         prev_total_partitons = 0
         iterdata = []
-        for total_partitions in map_job['parts_per_object']:
+        for total_partitions in map_job.parts_per_object:
             iterdata.append([map_futures[prev_total_partitons:prev_total_partitons+total_partitions]])
             prev_total_partitons = prev_total_partitons + total_partitions
 
@@ -104,22 +110,26 @@ def create_reduce_job(config, internal_storage, executor_id, reduce_job_id, redu
 
     iterdata = utils.verify_args(reduce_function, iterdata, None)
 
-    return _create_job(config, internal_storage, executor_id,
-                       reduce_job_id, reduce_function,
-                       iterdata, runtime_meta=runtime_meta,
+    return _create_job(config=config,
+                       internal_storage=internal_storage,
+                       executor_id=executor_id,
+                       job_id=reduce_job_id,
+                       func=reduce_function,
+                       iterdata=iterdata,
+                       runtime_meta=runtime_meta,
                        runtime_memory=runtime_memory,
                        extra_env=ext_env,
                        include_modules=include_modules,
                        exclude_modules=exclude_modules,
                        execution_timeout=execution_timeout,
-                       job_created_tstamp=job_created_tstamp,
+                       host_job_meta=host_job_meta,
                        already_invoked=already_invoked)
 
 
-def _create_job(config, internal_storage, executor_id, job_id, func, data, runtime_meta,
-                runtime_memory=None, extra_env=None, invoke_pool_threads=128, include_modules=[],
-                exclude_modules=[], execution_timeout=None, job_created_tstamp=None,
-                already_invoked=False):
+def _create_job(config, internal_storage, executor_id, job_id, func,
+                iterdata, runtime_meta, runtime_memory, extra_env,
+                include_modules, exclude_modules, execution_timeout,
+                host_job_meta, invoke_pool_threads=128, already_invoked=False):
     """
     :param func: the function to map over the data
     :param iterdata: An iterable of input data
@@ -133,39 +143,45 @@ def _create_job(config, internal_storage, executor_id, job_id, func, data, runti
     :return: A list with size `len(iterdata)` of futures for each job
     :rtype:  list of futures.
     """
-    log_level = os.getenv('PYWREN_LOGLEVEL')
-
-    runtime_name = config['pywren']['runtime']
-    if runtime_memory is None:
-        runtime_memory = config['pywren']['runtime_memory']
+    log_level = logger.getEffectiveLevel() != logging.WARNING
 
     ext_env = {} if extra_env is None else extra_env.copy()
     if ext_env:
         ext_env = utils.convert_bools_to_string(ext_env)
         logger.debug("Extra environment vars {}".format(ext_env))
 
-    if not data:
-        return []
+    job = SimpleNamespace()
+    job.executor_id = executor_id
+    job.job_id = job_id
+    job.extra_env = ext_env
+    job.execution_timeout = execution_timeout or config['lithops']['execution_timeout']
+    job.function_name = func.__name__
+    job.total_calls = len(iterdata)
 
-    if execution_timeout is None:
-        execution_timeout = config['pywren']['runtime_timeout'] - 5
+    mode = config['lithops']['mode']
 
-    host_job_meta = {}
-    job_description = {}
-    job_description['runtime_name'] = runtime_name
-    job_description['runtime_memory'] = runtime_memory
-    job_description['execution_timeout'] = execution_timeout
-    job_description['function_name'] = func.__name__
-    job_description['extra_env'] = ext_env
-    job_description['total_calls'] = len(data)
-    job_description['invoke_pool_threads'] = invoke_pool_threads
-    job_description['executor_id'] = executor_id
-    job_description['job_id'] = job_id
-    job_description['already_invoked'] = already_invoked
+    if mode == SERVERLESS:
+        job.invoke_pool_threads = invoke_pool_threads
+        job.runtime_memory = runtime_memory or config['serverless']['runtime_memory']
+        job.runtime_timeout = config['serverless']['runtime_timeout']
+        if job.execution_timeout >= job.runtime_timeout:
+            job.execution_timeout = job.runtime_timeout - 5
+
+    elif mode == STANDALONE:
+        job.runtime_memory = None
+        runtime_timeout = config['standalone']['hard_dismantle_timeout']
+        if job.execution_timeout >= runtime_timeout:
+            job.execution_timeout = runtime_timeout - 10
+
+    elif mode == LOCALHOST:
+        job.runtime_memory = None
+        job.runtime_timeout = execution_timeout
+
+    job.already_invoked = already_invoked
 
     if not already_invoked:
-        exclude_modules_cfg = config['pywren'].get('exclude_modules', [])
-        include_modules_cfg = config['pywren'].get('include_modules', [])
+        exclude_modules_cfg = config['lithops'].get('exclude_modules', [])
+        include_modules_cfg = config['lithops'].get('include_modules', [])
 
         exc_modules = set()
         inc_modules = set()
@@ -182,11 +198,10 @@ def _create_job(config, internal_storage, executor_id, job_id, func, data, runti
         if include_modules is None:
             inc_modules = None
 
-        host_job_meta = {'job_created_tstamp': job_created_tstamp}
-
         logger.debug('ExecutorID {} | JobID {} - Serializing function and data'.format(executor_id, job_id))
+        job_serialize_start = time.time()
         serializer = SerializeIndependent(runtime_meta['preinstalls'])
-        func_and_data_ser, mod_paths = serializer([func] + data, inc_modules, exc_modules)
+        func_and_data_ser, mod_paths = serializer([func] + iterdata, inc_modules, exc_modules)
         data_strs = func_and_data_ser[1:]
         data_size_bytes = sum(len(x) for x in data_strs)
         module_data = create_module_data(mod_paths)
@@ -194,12 +209,13 @@ def _create_job(config, internal_storage, executor_id, job_id, func, data, runti
         func_module_str = pickle.dumps({'func': func_str, 'module_data': module_data}, -1)
         func_module_size_bytes = len(func_module_str)
         total_size = utils.sizeof_fmt(data_size_bytes+func_module_size_bytes)
+        host_job_meta['host_job_serialize_time'] = round(time.time()-job_serialize_start, 6)
 
         host_job_meta['data_size_bytes'] = data_size_bytes
         host_job_meta['func_module_size_bytes'] = func_module_size_bytes
 
-        if 'data_limit' in config['pywren']:
-            data_limit = config['pywren']['data_limit']
+        if 'data_limit' in config['lithops']:
+            data_limit = config['lithops']['data_limit']
         else:
             data_limit = MAX_AGG_DATA_SIZE
 
@@ -210,69 +226,32 @@ def _create_job(config, internal_storage, executor_id, job_id, func, data, runti
 
         log_msg = ('ExecutorID {} | JobID {} - Uploading function and data '
                    '- Total: {}'.format(executor_id, job_id, total_size))
-        print(log_msg) if not log_level else logger.info(log_msg)
+        logger.info(log_msg)
+        if not log_level:
+            print(log_msg)
 
         # Upload data
         data_key = create_agg_data_key(JOBS_PREFIX, executor_id, job_id)
-        job_description['data_key'] = data_key
+        job.data_key = data_key
         data_bytes, data_ranges = utils.agg_data(data_strs)
-        job_description['data_ranges'] = data_ranges
+        job.data_ranges = data_ranges
         data_upload_start = time.time()
         internal_storage.put_data(data_key, data_bytes)
         data_upload_end = time.time()
 
-        host_job_meta['data_upload_time'] = round(data_upload_end-data_upload_start, 6)
+        host_job_meta['host_data_upload_time'] = round(data_upload_end-data_upload_start, 6)
 
         # Upload function and modules
         func_upload_start = time.time()
         func_key = create_func_key(JOBS_PREFIX, executor_id, job_id)
-        job_description['func_key'] = func_key
+        job.func_key = func_key
         internal_storage.put_func(func_key, func_module_str)
         func_upload_end = time.time()
 
-        host_job_meta['func_upload_time'] = round(func_upload_end - func_upload_start, 6)
+        host_job_meta['host_func_upload_time'] = round(func_upload_end - func_upload_start, 6)
 
-    job_description['metadata'] = host_job_meta
+        host_job_meta['host_job_created_time'] = round(time.time() - host_job_meta['host_job_create_tstamp'], 6)
 
-    return job_description
+    job.metadata = host_job_meta
 
-
-def clean_job(jobs_to_clean, storage_config, clean_cloudobjects):
-    """
-    Clean the jobs in a separate process
-    """
-    with tempfile.NamedTemporaryFile(delete=False) as temp:
-        pickle.dump(jobs_to_clean, temp)
-        jobs_path = temp.name
-
-    script = """
-    from pywren_ibm_cloud.storage import InternalStorage
-    from pywren_ibm_cloud.storage.utils import clean_bucket
-    from pywren_ibm_cloud.config import JOBS_PREFIX, TEMP_PREFIX
-    import pickle
-    import os
-
-    storage_config = {}
-    clean_cloudobjects = {}
-    jobs_path = '{}'
-    bucket = storage_config['bucket']
-
-    with open(jobs_path, 'rb') as pk:
-        jobs_to_clean = pickle.load(pk)
-
-    internal_storage = InternalStorage(storage_config)
-    storage = internal_storage.storage
-
-    for executor_id, job_id in jobs_to_clean:
-        prefix = '/'.join([JOBS_PREFIX, executor_id, job_id])
-        clean_bucket(storage, bucket, prefix, log=False)
-        if clean_cloudobjects:
-            prefix = '/'.join([TEMP_PREFIX, executor_id, job_id])
-            clean_bucket(storage, bucket, prefix, log=False)
-
-    if os.path.exists(jobs_path):
-        os.remove(jobs_path)
-    """.format(storage_config, clean_cloudobjects, jobs_path)
-
-    cmdstr = '{} -c "{}"'.format(sys.executable, textwrap.dedent(script))
-    os.popen(cmdstr)
+    return job

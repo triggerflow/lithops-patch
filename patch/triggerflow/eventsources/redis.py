@@ -31,7 +31,7 @@ class RedisEventSource:
         return redis_config
 
     def get_events(self):
-        if os.environ.get('PYWREN_FIRST_EXEC') == 'False':
+        if os.environ.get('LITHOPS_FIRST_EXEC') == 'False':
             logger.info('Event sourcing - Recovering events from redis stream: {}'.format(self.stream))
             to = time.time()
             redis_client = redis.StrictRedis(host=self.host, port=self.port,

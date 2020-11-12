@@ -12,9 +12,9 @@ class KafkaEventSource:
         self.config = config
 
     def get_events(self):
-        if os.environ.get('PYWREN_FIRST_EXEC') == 'False':
+        if os.environ.get('LITHOPS_FIRST_EXEC') == 'False':
             to = time.time()
-            consumer = KafkaConsumer('pywren-kafka-eventsource', bootstrap_servers=self.config['kafka']['broker_list'],
+            consumer = KafkaConsumer('lithops-kafka-eventsource', bootstrap_servers=self.config['kafka']['broker_list'],
                                      auto_offset_reset='earliest', enable_auto_commit=False)
             logger.info('Downloading Events')
             kafka_data = consumer.poll(timeout_ms=10000, max_records=10000)
@@ -39,8 +39,8 @@ class KafkaEventSource:
 
         kafka_config = self.config['kafka']
         kafka_config['class'] = 'KafkaEventSource'
-        kafka_config['topic'] = 'pywren-kafka-eventsource'
-        kafka_config['name'] = 'pywren-kafka-eventsource'
+        kafka_config['topic'] = 'lithops-kafka-eventsource'
+        kafka_config['name'] = 'lithops-kafka-eventsource'
         os.environ['__OW_TF_SINK'] = json.dumps(kafka_config)
 
         return event_sourcing_jobs

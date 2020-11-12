@@ -1,19 +1,18 @@
 import os
 import sys
-import copy
 import logging
 import inspect
 import zipfile
 
-import pywren_ibm_cloud
-from pywren_ibm_cloud.libs.openwhisk.client import OpenWhiskClient
-from pywren_ibm_cloud.utils import create_executor_id
-from pywren_ibm_cloud.config import default_config
+import lithops
+from lithops.libs.openwhisk.client import OpenWhiskClient
+from lithops.utils import create_executor_id
+from lithops.config import default_config
 
 logger = logging.getLogger(__name__)
 
 
-FH_ZIP_LOCATION = os.path.join(os.getcwd(), 'pywren_ibmcf.zip')
+FH_ZIP_LOCATION = os.path.join(os.getcwd(), 'lithops_ibmcf.zip')
 RUNTIME_DEFAULT = {'3.6': 'triggerflow/ibm_cloud_functions_runtime-v36',
                    '3.7': 'triggerflow/ibm_cloud_functions_runtime-v37',
                    '3.8': 'triggerflow/ibm_cloud_functions_runtime-v38'}
@@ -28,8 +27,8 @@ class TriggerflowExecutor:
         """
         Initialize a FunctionExecutor class.
 
-        :param config: Settings passed in here will override those in config file. Default None.
-        :param runtime: Runtime name to use. Default None.
+        :param config: Settings passed in here will override those in config file.
+        :param runtime: Runtime name to use.
         """
 
         self.config = config
@@ -48,13 +47,13 @@ class TriggerflowExecutor:
             for file in os.listdir(full_dir_path):
                 full_path = os.path.join(full_dir_path, file)
                 if os.path.isfile(full_path):
-                    zip_file.write(full_path, os.path.join('pywren_ibm_cloud', sub_dir, file))
+                    zip_file.write(full_path, os.path.join('lithops', sub_dir, file))
                 elif os.path.isdir(full_path) and '__pycache__' not in full_path:
                     add_folder_to_zip(zip_file, full_path, os.path.join(sub_dir, file))
 
         try:
             with zipfile.ZipFile(FH_ZIP_LOCATION, 'w', zipfile.ZIP_DEFLATED) as pywren_zip:
-                module_location = os.path.dirname(os.path.abspath(pywren_ibm_cloud.__file__))
+                module_location = os.path.dirname(os.path.abspath(lithops.__file__))
                 pywren_zip.write(main_exec_file, '__main__.py')
                 add_folder_to_zip(pywren_zip, module_location)
         except Exception:

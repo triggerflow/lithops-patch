@@ -12,7 +12,7 @@ class ObjectStorageEventSource:
         self.config = config
 
     def get_events(self):
-        if os.environ.get('PYWREN_FIRST_EXEC') == 'False':
+        if os.environ.get('LITHOPS_FIRST_EXEC') == 'False':
             logger.info('Event sourcing - Searching results in storage')
             to = time.time()
             done_jobs = self.internal_storage.get_executor_status(self.executor_id)
@@ -30,8 +30,8 @@ class ObjectStorageEventSource:
 
         redis_config = self.config['redis']
         redis_config['class'] = 'RedisEventSource'
-        redis_config['stream'] = 'pywren-redis-eventsource'
-        redis_config['name'] = 'pywren-redis-eventsource'
+        redis_config['stream'] = 'lithops-redis-eventsource'
+        redis_config['name'] = 'lithops-redis-eventsource'
         os.environ['__OW_TF_SINK'] = json.dumps(redis_config)
 
         return event_sourcing_jobs
