@@ -1,7 +1,7 @@
 from triggerflow import Triggerflow
 from triggerflow.eventsources import KafkaEventSource, RedisEventSource
-from pywren_ibm_cloud.triggerflow import TriggerflowExecutor
-import pywren_ibm_cloud as pywren
+from lithops.triggerflow import TriggerflowExecutor
+import lithops
 import os
 import time
 import yaml
@@ -15,13 +15,13 @@ def my_function(x):
 def main(args):
     os.environ['PYWREN_EVENT_SOURCING'] = 'True'
 
-    pw = pywren.ibm_cf_executor(**args, log_level='INFO')
+    fexec = lithops.FunctionExecutor(**args, log_level='INFO')
 
-    pw.map(my_function, range(10))
-    res = pw.get_result()
+    fexec.map(my_function, range(10))
+    res = fexec.get_result()
 
-    pw.map(my_function, res)
-    res = pw.get_result()
+    fexec.map(my_function, res)
+    res = fexec.get_result()
 
     print(res)
 
@@ -29,7 +29,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    with open('pywren_config.yaml', 'r') as config_file:
+    with open('lithops_config.yaml', 'r') as config_file:
         tf_config = yaml.safe_load(config_file)
     tf_exec = TriggerflowExecutor(config=tf_config)
-    tf_exec.run(main, name='triggerflow_pywren_map')
+    tf_exec.run(main, name='triggerflow_lithops_map')

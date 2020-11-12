@@ -1,6 +1,6 @@
 # Triggerflow patch for Lithops
 
-This repository contains all the necessary files to make the IBM-PyWren library running with the Triggerflow system. Note that this patch will modify the local `lithops` installation once applied. 
+This repository contains all the necessary files to make the **Lithops** library running with the Triggerflow system. Note that this patch will modify the local `lithops` installation once applied. 
 
 The Triggerflow patch for `lithops` is shipped with 4 different event sources: *kafka*, *Redis*, *Cloudant* and *IBM Cloud Object Store*. An event source is the place where the termination event of a functions is stored.
 

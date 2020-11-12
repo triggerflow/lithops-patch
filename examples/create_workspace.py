@@ -3,7 +3,7 @@ from triggerflow.eventsources import RedisEventSource
 import yaml
 
 if __name__ == "__main__":
-    with open('pywren_config.yaml', 'r') as config_file:
+    with open('lithops_config.yaml', 'r') as config_file:
         tf_config = yaml.safe_load(config_file)
 
     tf = Triggerflow(endpoint=tf_config['triggerflow']['endpoint'],
